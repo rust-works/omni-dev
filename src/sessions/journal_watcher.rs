@@ -108,7 +108,7 @@ const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 const PID_START_SLACK: chrono::Duration = chrono::Duration::seconds(2);
 
 /// How long a stray compaction temp file survives before it is swept.
-const STALE_TMP_AGE: Duration = Duration::from_secs(60 * 60);
+const STALE_TMP_AGE: Duration = Duration::from_hours(1);
 
 /// The agents whose hooks write journals.
 const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];

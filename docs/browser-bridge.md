@@ -159,8 +159,7 @@ invocations stay at `warn`; `RUST_LOG` overrides either.
 
 ### Menu bar (macOS, `menu-bar` feature)
 
-Built with `--features menu-bar` on macOS (which needs rustc 1.92+, above the
-crate's 1.88 floor), the daemon adds a **Browser Bridge**
+Built with `--features menu-bar` on macOS, the daemon adds a **Browser Bridge**
 menu showing the connection line (`Connected — <origins> — N pending` /
 `No tab connected`) and a **masked** session key (`Key: ••••<last 4 chars>`, so
 the full token never appears in the menu bar, screenshots, or screen shares),

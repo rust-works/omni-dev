@@ -11,7 +11,7 @@ documentation = "https://docs.rs/omni-dev"
 readme = "README.md"
 keywords = ["git", "ai", "claude", "mcp", "conventional-commits"]
 categories = ["development-tools", "command-line-utilities"]
-rust-version = "1.88.0"
+rust-version = "1.92.0"
 # Keep the published crate under crates.io's 10 MiB upload limit by dropping
 # assets that consumers of the library/binary do not need: the promo website,
 # social-preview images, scratch space, the VS Code companion extension
@@ -83,9 +83,9 @@ arboard = "3.6.1"
 # terminal panes (issue #1585 Phase 3): a complete VTE-based core with
 # scrollback, the selection model (simple/block/semantic/line, soft-wrap-aware
 # extraction), and its own cross-platform `tty` layer — so no separate
-# `portable-pty`. Pinned to 0.26 alongside `ratatui` 0.30 (both need the
-# 1.88 MSRV declared above). Apache-2.0 — the crate's first Apache-2.0 core
-# dependency, noted at review.
+# `portable-pty`. Pinned to 0.26 alongside `ratatui` 0.30 (both need rustc
+# 1.88, within the MSRV declared above). Apache-2.0 — the crate's first
+# Apache-2.0 core dependency, noted at review.
 alacritty_terminal = "0.26"
 # Display-width maths for `omni-dev worktrees ui`'s tab strip and tree
 # columns (issue #1585 Phase 4): already in the tree transitively via
@@ -130,13 +130,10 @@ nix = { version = "0.31", default-features = false, features = ["fs", "hostname"
 # requires. (`arboard` moved to the main `[dependencies]` table — it's no
 # longer tray-exclusive, see there.)
 #
-# tao 0.38 / tray-icon 0.27 need rustc 1.92, above the crate's 1.88
-# `rust-version`. That is deliberate (#2242): only an opt-in macOS
-# `--features menu-bar` build compiles them, so the default build keeps the
-# 1.88 floor, and a menu-bar build on an older rustc fails with cargo's own
-# rust-version error. The bump moves their Linux GTK stack to gtk 0.19 /
-# glib 0.22, clearing RUSTSEC-2024-0429 (glib) and RUSTSEC-2024-0370
-# (proc-macro-error) from the lockfile.
+# tao 0.38 / tray-icon 0.27 (and muda 0.22) need rustc 1.92, which set the
+# crate's `rust-version` above (#2242). The bump moves their Linux GTK stack
+# to gtk 0.19 / glib 0.22, clearing RUSTSEC-2024-0429 (glib) and
+# RUSTSEC-2024-0370 (proc-macro-error) from the lockfile.
 tao = { version = "0.38.0", optional = true }
 tray-icon = { version = "0.27.0", optional = true }
 # CoreFoundation types for the worktrees service's Accessibility backend

@@ -1,7 +1,7 @@
 too-many-arguments-threshold = 7
 cognitive-complexity-threshold = 25
 type-complexity-threshold = 250
-msrv = "1.88.0"
+msrv = "1.92.0"
 
 # A shallow clone's cut is applied only through the gitdir of the handle libgit2
 # opened, so a handle rooted at a linked worktree fails on the parents a `--depth`

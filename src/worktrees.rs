@@ -50,7 +50,7 @@ const DEFAULT_TTL: Duration = Duration::from_secs(30);
 /// Enabling polling for a repo is deliberately **temporary** — 15 minutes — so an
 /// idle repo stops costing GitHub budget without the user remembering to disable
 /// it; re-enabling refreshes the lease.
-const DEFAULT_POLL_LEASE: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_POLL_LEASE: Duration = Duration::from_mins(15);
 
 /// Ceiling on live registry entries, so a misbehaving companion flooding
 /// `register` with distinct keys cannot grow daemon memory faster than the TTL

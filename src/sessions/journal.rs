@@ -41,7 +41,7 @@ use crate::daemon::paths;
 /// How long a journal may sit unwritten before it is deleted, and the oldest last
 /// event a replay will accept. Generous: a session left open and idle for days is
 /// real, and a live pid is cheap proof.
-pub const MAX_JOURNAL_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+pub const MAX_JOURNAL_AGE: std::time::Duration = std::time::Duration::from_hours(7 * 24);
 
 /// The size past which the hook sink stops appending to a journal. The daemon
 /// compacts a journal long before this, so reaching it means nothing is reading

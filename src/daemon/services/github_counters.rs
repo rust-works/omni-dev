@@ -51,7 +51,7 @@ use crate::request_log;
 /// Delay before the first ("startup") summary, so the pollers have come up.
 const STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// Interval between periodic summaries after the first one.
-const PERIODIC_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const PERIODIC_INTERVAL: Duration = Duration::from_mins(10);
 /// The longest the final summary may spend reading the log. Normally it reads a
 /// few minutes of records and finishes in milliseconds; this only bites when the
 /// log was replaced and has to be rescanned, or rotated and the rotated files have

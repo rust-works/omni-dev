@@ -926,8 +926,7 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ## 🔧 Requirements
 
-- **Rust**: 1.88+ (for installation from source; 1.92+ to build the optional macOS
-  `menu-bar` feature)
+- **Rust**: 1.92+ (for installation from source)
 - **Claude API Key**: Required for AI-powered features
   - See [Authentication](docs/configuration.md#authentication) for
     setup (env var, `.env`, or CI/CD secrets)

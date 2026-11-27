@@ -439,7 +439,7 @@ mod tests {
         *gate = Some(CacheEntry {
             instance_url: url.clone(),
             fetched_at: Instant::now()
-                .checked_sub(Duration::from_secs(3600 * 24))
+                .checked_sub(Duration::from_hours(24))
                 .unwrap(),
             value: Arc::new(Vec::new()),
         });
@@ -631,7 +631,7 @@ mod tests {
                 CacheEntry {
                     instance_url: url.clone(),
                     fetched_at: Instant::now()
-                        .checked_sub(Duration::from_secs(3600 * 24))
+                        .checked_sub(Duration::from_hours(24))
                         .unwrap(),
                     value: Arc::new(EditMeta::default()),
                 },
