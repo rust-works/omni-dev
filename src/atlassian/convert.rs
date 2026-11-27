@@ -1074,7 +1074,7 @@ impl<'a> MarkdownParser<'a> {
             let line = lines[i];
             if let Some((d, _)) = try_parse_container_open(line) {
                 if d.name == "tr" {
-                    let tr_attrs = d.attrs.clone();
+                    let tr_attrs = d.attrs;
                     i += 1;
                     let (mut row, next_i) = self.parse_directive_table_row(&lines, i)?;
                     // Pass through localId from :::tr{localId=...}
@@ -1089,7 +1089,7 @@ impl<'a> MarkdownParser<'a> {
                     continue;
                 }
                 if d.name == "caption" {
-                    let dir_attrs = d.attrs.clone();
+                    let dir_attrs = d.attrs;
                     i += 1;
                     let mut caption_lines = Vec::new();
                     while i < lines.len() {
@@ -1135,7 +1135,7 @@ impl<'a> MarkdownParser<'a> {
             if let Some((d, _)) = try_parse_container_open(line) {
                 if depth == 0 && (d.name == "th" || d.name == "td") {
                     let is_header = d.name == "th";
-                    let cell_attrs = d.attrs.clone();
+                    let cell_attrs = d.attrs;
                     i += 1;
                     let (cell, next_i) =
                         self.parse_directive_table_cell(lines, i, is_header, cell_attrs)?;
