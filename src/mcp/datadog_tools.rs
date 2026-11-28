@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn epoch_to_rfc3339_clamps_out_of_range_to_epoch() {
-        // chrono rejects timestamps beyond i64 seconds; the fallback
+        // A timestamp holds only the years -9999..=9999; the fallback
         // path simply returns *some* RFC 3339 string.
         let s = epoch_to_rfc3339(i64::MAX);
         assert!(s.ends_with('Z'));
