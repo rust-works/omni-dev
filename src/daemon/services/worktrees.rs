@@ -5313,6 +5313,21 @@ mod tests {
     };
     use std::sync::MutexGuard;
 
+    #[test]
+    fn persisted_poll_timestamps_keep_their_serialized_form() {
+        // Both files outlive the daemon that wrote them (#1376, #1389, #2257).
+        let lease = json!({ "enabled": [{ "repo": "o/r", "expires_at": "2026-01-01T00:00:00Z" }] });
+        crate::test_support::timestamp_forms::assert_round_trips::<PollingPrefs>(
+            &lease,
+            "/enabled/0/expires_at",
+        );
+        let cache = json!({ "entries": [], "watched": [], "polled_at": "2026-01-01T00:00:00Z" });
+        crate::test_support::timestamp_forms::assert_round_trips::<PrCachePrefs>(
+            &cache,
+            "/polled_at",
+        );
+    }
+
     fn register_payload(key: &str, repo: Option<&str>, folder: &str) -> Value {
         json!({
             "key": key,

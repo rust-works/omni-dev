@@ -1710,6 +1710,17 @@ mod tests {
     use crate::test_support::env::MapEnv;
 
     #[test]
+    fn record_timestamps_are_utc_millis() {
+        // `ts` is part of the on-disk log format and what `--since`/`--until`
+        // compare against (#2257).
+        let form = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$").unwrap();
+        for _ in 0..100 {
+            let ts = now_rfc3339_millis();
+            assert!(form.is_match(&ts), "{ts}");
+        }
+    }
+
+    #[test]
     fn record_round_trips_through_json() {
         let mut rec = LogRecord::new(RecordKind::Http, "inv-1".to_string());
         rec.service = Some("jira".to_string());

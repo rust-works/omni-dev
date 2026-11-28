@@ -1117,6 +1117,22 @@ mod tests {
     }
 
     #[test]
+    fn last_seen_keeps_its_serialized_form() {
+        // `list`/`status` replies carry it to every client, which compute an
+        // age from it (#2257).
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", Some("repo-a"), "/tmp/a"));
+        let base = reg.list().remove(0);
+        crate::test_support::timestamp_forms::assert_serializes(
+            |s| WindowEntry {
+                last_seen: crate::test_support::timestamp_forms::parse(s),
+                ..base.clone()
+            },
+            "/last_seen",
+        );
+    }
+
+    #[test]
     fn register_then_list_round_trips() {
         let reg = WorktreesRegistry::new();
         reg.register(register_request("w1", Some("repo-a"), "/tmp/a"));

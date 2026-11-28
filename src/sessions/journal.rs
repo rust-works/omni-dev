@@ -386,6 +386,25 @@ mod tests {
     }
 
     #[test]
+    fn the_ts_field_keeps_its_serialized_form() {
+        // A journal outlives the binary that wrote it, so the timestamp's form is
+        // part of the file format (#2257).
+        let record = JournalRecord::observe(
+            &observe_req(SessionEvent::PostToolUse),
+            &stamp("2026-10-03T03:40:23Z", "7-1"),
+        );
+        let template = serde_json::to_value(record).unwrap();
+        crate::test_support::timestamp_forms::assert_round_trips::<JournalRecord>(&template, "/ts");
+    }
+
+    #[test]
+    fn an_event_stamp_keeps_its_serialized_form() {
+        // The stamp rides the socket POST as well as the journal (#2108, #2257).
+        let template = serde_json::to_value(stamp("2026-10-03T03:40:23Z", "7-1")).unwrap();
+        crate::test_support::timestamp_forms::assert_round_trips::<EventStamp>(&template, "/ts");
+    }
+
+    #[test]
     fn the_line_shape_is_the_documented_one() {
         let st = stamp("2026-10-03T03:40:23.186Z", "7-1");
         let mut req = observe_req(SessionEvent::PostToolUse);

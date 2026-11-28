@@ -682,6 +682,41 @@ mod tests {
         QueryContext::default()
     }
 
+    #[test]
+    fn session_info_timestamps_keep_their_serialized_form() {
+        // The `sessions`/`status` replies are the service's downstream contract
+        // (docs/snowflake-service.md, #2257).
+        let info = |s: &str| SessionInfo {
+            id: 1,
+            account: "ACCT".to_string(),
+            user: "user".to_string(),
+            created_at: crate::test_support::timestamp_forms::parse(s),
+            last_used: crate::test_support::timestamp_forms::parse(s),
+            query_count: 1,
+            sessions: 1,
+            max_sessions: 4,
+            members: vec![MemberInfo {
+                id: 1,
+                busy: true,
+                context: ctx(),
+                last_used: crate::test_support::timestamp_forms::parse(s),
+                query_count: 1,
+                running: Some(RunningQuery {
+                    sql: "select 1".to_string(),
+                    started_at: crate::test_support::timestamp_forms::parse(s),
+                }),
+            }],
+        };
+        for pointer in [
+            "/created_at",
+            "/last_used",
+            "/members/0/last_used",
+            "/members/0/running/started_at",
+        ] {
+            crate::test_support::timestamp_forms::assert_serializes(info, pointer);
+        }
+    }
+
     fn fake_pool(max: usize) -> (SessionPool<u32>, Arc<AtomicU32>) {
         let pool = SessionPool::<u32>::new(
             1,

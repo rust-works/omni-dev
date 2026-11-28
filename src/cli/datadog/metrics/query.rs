@@ -280,6 +280,18 @@ mod tests {
     }
 
     #[test]
+    fn format_timestamp_truncates_sub_second_millis() {
+        // #2257: the fraction is dropped, not rounded.
+        assert_eq!(
+            format_timestamp(1_700_000_000_999.0),
+            "2023-11-14T22:13:20Z"
+        );
+        // The whole seconds truncate toward zero and the fraction is taken
+        // modulo 1000, so a millisecond before the epoch reads as the epoch.
+        assert_eq!(format_timestamp(-1.0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
     fn format_timestamp_is_rfc3339_utc() {
         // 1_700_000_000_000 ms == 2023-11-14T22:13:20Z
         let s = format_timestamp(1_700_000_000_000.0);

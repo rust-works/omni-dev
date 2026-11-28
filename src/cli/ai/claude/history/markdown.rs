@@ -848,6 +848,21 @@ fn normalise_whitespace(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_ts_truncates_to_whole_seconds_in_utc() {
+        // Rounding would move an event into the next second (#2257).
+        for (input, expected) in [
+            ("2026-05-03T03:14:22Z", "2026-05-03T03:14:22Z"),
+            ("2026-05-03T03:14:22.999Z", "2026-05-03T03:14:22Z"),
+            ("2026-05-03T13:14:22.5+10:00", "2026-05-03T03:14:22Z"),
+        ] {
+            assert_eq!(
+                format_ts(crate::test_support::timestamp_forms::parse(input)),
+                expected
+            );
+        }
+    }
+
     fn opts<'a>() -> RenderOptions<'a> {
         RenderOptions {
             project_slug: "-Users-jky-foo",

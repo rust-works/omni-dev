@@ -491,6 +491,21 @@ mod tests {
     }
 
     #[test]
+    fn session_entry_wire_reads_every_last_seen_form_the_daemon_writes() {
+        // The daemon may be a different build than this UI (#2257).
+        let template = serde_json::json!({
+            "session_id": "abc",
+            "state": "idle",
+            "last_seen": "2026-01-01T00:00:00Z",
+        });
+        crate::test_support::timestamp_forms::assert_deserializes(
+            &template,
+            "/last_seen",
+            |entry: &SessionEntryWire| entry.last_seen,
+        );
+    }
+
+    #[test]
     fn session_entry_wire_mirrors_the_agent_tag_including_unknown_ones() {
         let entry = |agent: &str| -> SessionEntryWire {
             serde_json::from_value(serde_json::json!({

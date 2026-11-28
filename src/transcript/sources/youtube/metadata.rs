@@ -327,6 +327,33 @@ mod tests {
     }
 
     #[test]
+    fn fetched_at_keeps_its_serialized_form() {
+        // The sidecar outlives the binary that wrote it, and `fetched_at` is
+        // its refresh-staleness key (#2257).
+        let meta = parse(WITH_MICROFORMAT, fixed_fetched_at()).unwrap();
+        let template = serde_json::to_value(&meta).unwrap();
+        crate::test_support::timestamp_forms::assert_round_trips::<VideoMetadata>(
+            &template,
+            "/fetched_at",
+        );
+        for (input, expected) in crate::test_support::timestamp_forms::UTC {
+            let yaml = serde_norway::to_string(&VideoMetadata {
+                fetched_at: crate::test_support::timestamp_forms::parse(input),
+                ..meta.clone()
+            })
+            .unwrap();
+            assert!(
+                yaml.contains(&format!("\nfetched_at: {expected}\n")),
+                "{yaml}"
+            );
+            assert_eq!(
+                read_fetched_at(&yaml),
+                Some(crate::test_support::timestamp_forms::parse(expected))
+            );
+        }
+    }
+
+    #[test]
     fn parse_tolerates_absent_microformat() {
         let meta = parse(NO_MICROFORMAT, fixed_fetched_at()).unwrap();
         assert_eq!(meta.video_id, "noMicro1234");
