@@ -428,7 +428,11 @@ impl HookOp {
             }
         };
         if let Some(stamp) = stamp {
-            payload["stamp"] = json!({ "ts": stamp.ts, "seq": stamp.seq });
+            // The same form the journal record writes (#2257).
+            payload["stamp"] = json!({
+                "ts": crate::utils::time::rfc3339(stamp.ts),
+                "seq": stamp.seq,
+            });
         }
         Some((op, payload))
     }
@@ -2017,6 +2021,26 @@ mod tests {
         // It went on to report, which is what the fail-open sink is for.
         assert!(logs.contains("transport_failed"), "{logs}");
         assert!(!logs.contains("CONTENT_SECRET"), "{logs}");
+    }
+
+    #[test]
+    fn the_wire_stamp_keeps_the_journal_form() {
+        // The socket copy and the journal copy of one event carry the same
+        // string (#2257).
+        let hook_op = serde_json::from_str::<HookPayload>(&journal_hook("Stop"))
+            .unwrap()
+            .to_hook_op(HookAgent::Claude, Some(5))
+            .unwrap();
+        crate::test_support::timestamp_forms::assert_serializes(
+            |s| {
+                let stamp = EventStamp {
+                    ts: crate::test_support::timestamp_forms::parse(s),
+                    seq: "7-1".to_string(),
+                };
+                hook_op.wire(HookAgent::Claude, Some(&stamp)).unwrap().1
+            },
+            "/stamp/ts",
+        );
     }
 
     #[test]
