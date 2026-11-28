@@ -2836,7 +2836,7 @@ mod tests {
             commits: vec![CommitInfo {
                 hash: format!("{:0>40}", 0),
                 author: "Test <test@test.com>".to_string(),
-                date: chrono::Utc::now().fixed_offset(),
+                date: jiff::Timestamp::now().into(),
                 original_message: "feat(test): add something".to_string(),
                 in_main_branches: Vec::new(),
                 analysis: CommitAnalysis {
@@ -3004,7 +3004,7 @@ mod tests {
             commits: vec![CommitInfo {
                 hash,
                 author: "Test <test@test.com>".to_string(),
-                date: chrono::Utc::now().fixed_offset(),
+                date: jiff::Timestamp::now().into(),
                 original_message: "feat(test): large commit".to_string(),
                 in_main_branches: Vec::new(),
                 analysis: CommitAnalysis {
@@ -3363,7 +3363,7 @@ mod tests {
                 CommitInfo {
                     hash: hash_a,
                     author: "Test <test@test.com>".to_string(),
-                    date: chrono::Utc::now().fixed_offset(),
+                    date: jiff::Timestamp::now().into(),
                     original_message: "feat(a): add a".to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {
@@ -3384,7 +3384,7 @@ mod tests {
                 CommitInfo {
                     hash: hash_b,
                     author: "Test <test@test.com>".to_string(),
-                    date: chrono::Utc::now().fixed_offset(),
+                    date: jiff::Timestamp::now().into(),
                     original_message: "feat(b): add b".to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {
@@ -3596,7 +3596,7 @@ mod tests {
                 CommitInfo {
                     hash: hash_a,
                     author: "Test <test@test.com>".to_string(),
-                    date: chrono::Utc::now().fixed_offset(),
+                    date: jiff::Timestamp::now().into(),
                     original_message: "feat(a): add module a".to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {
@@ -3624,7 +3624,7 @@ mod tests {
                 CommitInfo {
                     hash: hash_b,
                     author: "Test <test@test.com>".to_string(),
-                    date: chrono::Utc::now().fixed_offset(),
+                    date: jiff::Timestamp::now().into(),
                     original_message: "feat(b): add module b".to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {
@@ -3868,7 +3868,7 @@ mod tests {
                 commits: vec![CommitInfo {
                     hash: format!("{:0>40}", 0),
                     author: "Test <test@test.com>".to_string(),
-                    date: chrono::Utc::now().fixed_offset(),
+                    date: jiff::Timestamp::now().into(),
                     original_message: "feat(test): UNIQUE_COMMIT_SUBJECT_MARKER".to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {
@@ -3975,7 +3975,7 @@ mod tests {
             CommitInfo {
                 hash,
                 author: "Test <test@test.com>".to_string(),
-                date: chrono::Utc::now().fixed_offset(),
+                date: jiff::Timestamp::now().into(),
                 original_message: format!("feat({marker}): {}", "x".repeat(msg_size)),
                 in_main_branches: Vec::new(),
                 analysis: CommitAnalysis {
@@ -4060,7 +4060,7 @@ mod tests {
         let commit = CommitInfo {
             hash: "a".repeat(40),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             // ~80KB message → busts the 50K-context client's input budget
             // when wrapped in the full envelope, but the slimmer single-commit
             // view (envelope stripped) still fits with the small context.
@@ -4139,7 +4139,7 @@ mod tests {
         let commit = CommitInfo {
             hash: "c".repeat(40),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             // Message large enough that even the single-commit slim view
             // overflows the 50K context window's input budget.
             original_message: format!("feat: {}", "z".repeat(200_000)),
@@ -4314,7 +4314,7 @@ mod tests {
             commits: vec![CommitInfo {
                 hash,
                 author: "Test <test@test.com>".to_string(),
-                date: chrono::Utc::now().fixed_offset(),
+                date: jiff::Timestamp::now().into(),
                 original_message: "feat(big): add large module".to_string(),
                 in_main_branches: Vec::new(),
                 analysis: CommitAnalysis {

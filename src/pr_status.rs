@@ -428,8 +428,8 @@ fn parse_rate_limit(body: &Value) -> Option<QueryRateLimit> {
     let reset = rl
         .get("resetAt")
         .and_then(Value::as_str)
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map_or(0, |dt| dt.timestamp());
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+        .map_or(0, jiff::Timestamp::as_second);
     Some(QueryRateLimit {
         cost: rl.get("cost")?.as_u64()?,
         used: rl.get("used")?.as_u64()?,

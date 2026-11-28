@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use clap::ValueEnum;
+use jiff::Timestamp;
 use serde::Serialize;
 
 /// Output format shared by `history sync` (and any future siblings).
@@ -100,9 +100,9 @@ fn canonicalise_with_walkup(p: &Path) -> PathBuf {
 }
 
 /// Parses a `--since` value: relative duration shorthand (`30s`, `5m`, `2h`,
-/// `7d`, `4w`) or an RFC 3339 timestamp. Returns the `DateTime<Utc>` cutoff:
+/// `7d`, `4w`) or an RFC 3339 timestamp. Returns the `Timestamp` cutoff:
 /// sessions whose source mtime is **at or after** this cutoff are included.
-pub fn parse_since(spec: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+pub fn parse_since(spec: &str, now: Timestamp) -> Result<Timestamp> {
     let spec = spec.trim();
     if spec.is_empty() {
         anyhow::bail!("--since value is empty");
@@ -110,13 +110,14 @@ pub fn parse_since(spec: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     if let Some(seconds) = parse_relative_seconds(spec) {
         let secs = i64::try_from(seconds)
             .with_context(|| format!("--since duration {spec} is out of range"))?;
-        let delta = chrono::Duration::seconds(secs);
+        let delta = jiff::SignedDuration::from_secs(secs);
         return now
-            .checked_sub_signed(delta)
+            .checked_sub(delta)
+            .ok()
             .with_context(|| format!("--since {spec} underflows the calendar"));
     }
-    if let Ok(ts) = DateTime::parse_from_rfc3339(spec) {
-        return Ok(ts.with_timezone(&Utc));
+    if let Ok(ts) = spec.parse::<jiff::Timestamp>() {
+        return Ok(ts);
     }
     anyhow::bail!(
         "--since must be a relative duration like `7d` or an RFC3339 timestamp; got `{spec}`"
@@ -145,10 +146,10 @@ fn parse_relative_seconds(spec: &str) -> Option<u64> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use jiff::Timestamp;
 
-    fn fixed_now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
+    fn fixed_now() -> Timestamp {
+        "2026-05-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap()
     }
 
     #[test]
@@ -164,27 +165,27 @@ mod tests {
     #[test]
     fn since_seconds() {
         let cutoff = parse_since("30s", fixed_now()).unwrap();
-        assert_eq!(cutoff.timestamp(), fixed_now().timestamp() - 30);
+        assert_eq!(cutoff.as_second(), fixed_now().as_second() - 30);
     }
 
     #[test]
     fn since_minutes() {
         let cutoff = parse_since("15m", fixed_now()).unwrap();
-        assert_eq!(cutoff.timestamp(), fixed_now().timestamp() - 15 * 60);
+        assert_eq!(cutoff.as_second(), fixed_now().as_second() - 15 * 60);
     }
 
     #[test]
     fn since_hours() {
         let cutoff = parse_since("2h", fixed_now()).unwrap();
-        assert_eq!(cutoff.timestamp(), fixed_now().timestamp() - 2 * 60 * 60);
+        assert_eq!(cutoff.as_second(), fixed_now().as_second() - 2 * 60 * 60);
     }
 
     #[test]
     fn since_days() {
         let cutoff = parse_since("7d", fixed_now()).unwrap();
         assert_eq!(
-            cutoff.timestamp(),
-            fixed_now().timestamp() - 7 * 24 * 60 * 60
+            cutoff.as_second(),
+            fixed_now().as_second() - 7 * 24 * 60 * 60
         );
     }
 
@@ -192,21 +193,21 @@ mod tests {
     fn since_weeks() {
         let cutoff = parse_since("2w", fixed_now()).unwrap();
         assert_eq!(
-            cutoff.timestamp(),
-            fixed_now().timestamp() - 14 * 24 * 60 * 60
+            cutoff.as_second(),
+            fixed_now().as_second() - 14 * 24 * 60 * 60
         );
     }
 
     #[test]
     fn since_rfc3339() {
         let cutoff = parse_since("2026-05-01T11:00:00Z", fixed_now()).unwrap();
-        assert_eq!(cutoff.timestamp(), fixed_now().timestamp() - 60 * 60);
+        assert_eq!(cutoff.as_second(), fixed_now().as_second() - 60 * 60);
     }
 
     #[test]
     fn since_rfc3339_with_offset() {
         let cutoff = parse_since("2026-05-01T13:00:00+01:00", fixed_now()).unwrap();
-        assert_eq!(cutoff.timestamp(), fixed_now().timestamp());
+        assert_eq!(cutoff.as_second(), fixed_now().as_second());
     }
 
     #[test]

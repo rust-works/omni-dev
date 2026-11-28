@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -127,7 +127,7 @@ const MAX_WINDOWS: usize = 256;
 /// newer event in that gap. It is short so a wall clock stepped back by more than
 /// this can never freeze a session; the journal route has no such window, since a
 /// stale journal event is only ever redundant.
-const SOCKET_REORDER_WINDOW: chrono::Duration = chrono::Duration::seconds(10);
+const SOCKET_REORDER_WINDOW: jiff::SignedDuration = jiff::SignedDuration::from_secs(10);
 
 /// Whether `id` is a canonical hyphenated UUID (8-4-4-4-12 hex digits).
 ///
@@ -161,7 +161,8 @@ const MAX_RECENT_SEQS: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventStamp {
     /// When the hook fired, by the sink's wall clock.
-    pub ts: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub ts: Timestamp,
     /// The event's nonce.
     pub seq: String,
 }
@@ -703,10 +704,12 @@ pub struct SessionEntry {
     /// The most recent event observed for this session.
     pub last_event: SessionEvent,
     /// When the session was first observed (RFC 3339).
-    pub started_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub started_at: Timestamp,
     /// When the registry last heard from this session (RFC 3339). Wall-clock,
     /// for display only: liveness is measured on `last_active`.
-    pub last_seen: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub last_seen: Timestamp,
     /// When the registry last heard from this session, on the registry's
     /// [`AwakeClock`] — the stamp [`reap_sessions`] compares against, so a system
     /// sleep never ages an entry (#2108).
@@ -761,7 +764,7 @@ pub struct SessionEntry {
     /// The newest `ts` among the stamped events applied: a journal event older
     /// than this is stale and dropped (#2108).
     #[serde(skip)]
-    pub(crate) latest_stamp_ts: Option<DateTime<Utc>>,
+    pub(crate) latest_stamp_ts: Option<Timestamp>,
     /// Whether the current `state` was asserted directly — by a hook or an
     /// authoritative stream report — rather than defaulted or inferred from
     /// passive evidence (growth, a discovered transcript, a rollout's turn
@@ -807,12 +810,12 @@ impl SessionEntry {
         let behind = self.latest_stamp_ts.map(|latest| latest - stamp.ts);
         match (origin, behind) {
             (Origin::Journal | Origin::Replay, Some(behind))
-                if behind > chrono::Duration::zero() =>
+                if behind > jiff::SignedDuration::ZERO =>
             {
                 Some(Skip::JournalStale)
             }
             (Origin::Socket, Some(behind))
-                if behind > chrono::Duration::zero() && behind <= SOCKET_REORDER_WINDOW =>
+                if behind > jiff::SignedDuration::ZERO && behind <= SOCKET_REORDER_WINDOW =>
             {
                 Some(Skip::SocketReordered)
             }
@@ -911,7 +914,7 @@ impl SessionEntry {
 /// When an event is taken to have been seen, for the wall-clock `last_seen`: now
 /// for the socket, and the event's own `ts` for a journal event (never in the
 /// future), so a replayed history cannot look fresh (#2108).
-fn seen_at(stamp: Option<&EventStamp>, origin: Origin, now: DateTime<Utc>) -> DateTime<Utc> {
+fn seen_at(stamp: Option<&EventStamp>, origin: Origin, now: Timestamp) -> Timestamp {
     match (origin, stamp) {
         (Origin::Journal | Origin::Replay, Some(stamp)) => stamp.ts.min(now),
         _ => now,
@@ -1014,7 +1017,7 @@ pub(crate) struct PidCandidate {
     /// wrongly keep favouring a `/clear`-abandoned session forever over one a
     /// later `/resume` reactivated, since creation order never changes but
     /// `last_seen` moves with whichever session_id is actually receiving hooks.
-    pub(crate) last_seen: DateTime<Utc>,
+    pub(crate) last_seen: Timestamp,
 }
 
 /// One companion window-embedding report, with its liveness stamp.
@@ -1032,7 +1035,7 @@ struct WindowEntry {
     /// key, so it outranks the stale predecessor still inside its TTL, while
     /// two live windows keep a stable winner — `last_seen` would flap between
     /// them on every heartbeat.
-    registered_at: DateTime<Utc>,
+    registered_at: Timestamp,
 }
 
 /// The cross-window session registry.
@@ -1221,7 +1224,7 @@ impl SessionsRegistry {
         let event = req.event;
         let agent = req.agent;
         let pid = req.pid;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let seen = seen_at(stamp.as_ref(), origin, now);
         let awake = self.clock.now();
         let (changed, old_state, new_state, outcome, reaped) = {
@@ -1403,7 +1406,7 @@ impl SessionsRegistry {
         stamp: Option<EventStamp>,
         origin: Origin,
     ) -> bool {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let seen = seen_at(stamp.as_ref(), origin, now);
         let awake = self.clock.now();
         let (known, reaped, old_state, outcome) = {
@@ -1507,12 +1510,7 @@ impl SessionsRegistry {
     /// the watcher's snapshot can be one tick stale by the time it applies a
     /// decision. Never bumps: this only refreshes fields nothing renders,
     /// exactly like a window's unchanged heartbeat refresh.
-    pub(crate) fn confirm_pid_liveness(
-        &self,
-        session_id: &str,
-        now: DateTime<Utc>,
-        pid_start: &str,
-    ) {
+    pub(crate) fn confirm_pid_liveness(&self, session_id: &str, now: Timestamp, pid_start: &str) {
         let awake = self.clock.now();
         let mut sessions = self.lock_sessions();
         if let Some(entry) = sessions.get_mut(session_id) {
@@ -1537,7 +1535,7 @@ impl SessionsRegistry {
     pub fn report_window(&self, report: WindowReport) {
         let window_key = report.key.clone();
         let folder_count = report.folders.len();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let awake = self.clock.now();
         let (changed, outcome, reaped) = {
             let mut windows = self.lock_windows();
@@ -2232,7 +2230,7 @@ mod tests {
     fn confirm_pid_liveness_refreshes_last_seen_and_captures_the_token_once() {
         let reg = SessionsRegistry::new();
         reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
-        let old = Utc::now() - chrono::Duration::seconds(1000);
+        let old = Timestamp::now() - jiff::SignedDuration::from_secs(1000);
         let old_active = reg.lock_sessions()["s1"].last_active;
         {
             let mut guard = reg.lock_sessions();
@@ -2240,7 +2238,7 @@ mod tests {
         }
         reg.clock.advance(Duration::from_secs(1000));
 
-        reg.confirm_pid_liveness("s1", Utc::now(), "tok-1");
+        reg.confirm_pid_liveness("s1", Timestamp::now(), "tok-1");
         {
             let guard = reg.lock_sessions();
             let entry = &guard["s1"];
@@ -2254,7 +2252,7 @@ mod tests {
 
         // A later confirmation does not overwrite an already-captured token —
         // it is fixed at the pid's first independently-confirmed sighting.
-        reg.confirm_pid_liveness("s1", Utc::now(), "tok-2");
+        reg.confirm_pid_liveness("s1", Timestamp::now(), "tok-2");
         assert_eq!(
             reg.lock_sessions()["s1"].pid_start.as_deref(),
             Some("tok-1")
@@ -2265,14 +2263,14 @@ mod tests {
     fn confirm_pid_liveness_is_a_noop_for_an_unknown_or_ended_session() {
         let reg = SessionsRegistry::new();
         // Unknown session: no panic.
-        reg.confirm_pid_liveness("ghost", Utc::now(), "tok");
+        reg.confirm_pid_liveness("ghost", Timestamp::now(), "tok");
 
         reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
         reg.end("s1", None, Some(100));
         let before = reg.lock_sessions()["s1"].last_seen;
         let before_active = reg.lock_sessions()["s1"].last_active;
         reg.clock.advance(Duration::from_secs(1));
-        reg.confirm_pid_liveness("s1", Utc::now(), "tok");
+        reg.confirm_pid_liveness("s1", Timestamp::now(), "tok");
         assert_eq!(
             reg.lock_sessions()["s1"].last_seen,
             before,
@@ -2437,11 +2435,11 @@ mod tests {
 
     /// A window entry covering `/p`, registered `age_secs` ago.
     fn window_entry(key: &str, age_secs: i64) -> WindowEntry {
-        let now = Utc::now();
+        let now = Timestamp::now();
         WindowEntry {
             report: window_report(key, "/p", true),
             last_active: Duration::ZERO,
-            registered_at: now - chrono::Duration::seconds(age_secs),
+            registered_at: now - jiff::SignedDuration::from_secs(age_secs),
         }
     }
 
@@ -2465,7 +2463,7 @@ mod tests {
 
     #[test]
     fn resolve_source_breaks_equal_registrations_by_lowest_key() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let at_now = |key: &str| WindowEntry {
             report: window_report(key, "/p", true),
             last_active: Duration::ZERO,
@@ -2492,7 +2490,7 @@ mod tests {
         {
             let mut guard = reg.lock_windows();
             guard.get_mut("39-old").unwrap().registered_at =
-                Utc::now() - chrono::Duration::seconds(60);
+                Timestamp::now() - jiff::SignedDuration::from_secs(60);
         }
         reg.report_window(window_report("52-new", "/p", true));
         assert_eq!(reg.list()[0].source, vscode("52-new"));
@@ -2503,11 +2501,11 @@ mod tests {
 
     #[test]
     fn a_more_specific_folder_outranks_a_newer_parent_window() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let entry = |key: &str, folder: &str, age_secs: i64| WindowEntry {
             report: window_report(key, folder, true),
             last_active: Duration::ZERO,
-            registered_at: now - chrono::Duration::seconds(age_secs),
+            registered_at: now - jiff::SignedDuration::from_secs(age_secs),
         };
         // `parent` registered later and has the lower key, but `/repo/sub` is the
         // root the session actually runs in.
@@ -2564,7 +2562,7 @@ mod tests {
         {
             let mut guard = reg.lock_windows();
             guard.get_mut("a-old").unwrap().registered_at =
-                Utc::now() - chrono::Duration::seconds(60);
+                Timestamp::now() - jiff::SignedDuration::from_secs(60);
         }
         reg.report_window(window_report("z-new", "/p", true));
         assert_eq!(reg.list()[0].source, vscode("z-new"));
@@ -2594,7 +2592,7 @@ mod tests {
 
     #[test]
     fn evict_oldest_session_drops_the_longest_silent() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut sessions = HashMap::new();
         for (id, age) in [("young", 0_u64), ("old", 100), ("older", 200)] {
             sessions.insert(
@@ -2850,7 +2848,7 @@ mod tests {
         // highest-numbered id is unambiguously the oldest.
         {
             let mut sessions = reg.lock_sessions();
-            let base = Utc::now();
+            let base = Timestamp::now();
             for i in 0..MAX_SESSIONS {
                 let id = format!("s{i:04}");
                 sessions.insert(
@@ -2897,7 +2895,7 @@ mod tests {
         let reg = SessionsRegistry::new();
         {
             let mut windows = reg.lock_windows();
-            let base = Utc::now();
+            let base = Timestamp::now();
             for i in 0..MAX_WINDOWS {
                 let key = format!("w{i:04}");
                 windows.insert(
@@ -2930,7 +2928,7 @@ mod tests {
 
     #[test]
     fn evict_oldest_window_breaks_ties_by_key() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut windows = HashMap::new();
         let at = |key: &str, secs: u64| WindowEntry {
             report: WindowReport {
@@ -3556,7 +3554,7 @@ mod tests {
 
     /// Moves every wall-clock stamp back by `by`, as a laptop sleeping that long
     /// would, without any awake time passing.
-    fn jump_wall_clock_forward(reg: &SessionsRegistry, by: chrono::Duration) {
+    fn jump_wall_clock_forward(reg: &SessionsRegistry, by: jiff::SignedDuration) {
         for entry in reg.lock_sessions().values_mut() {
             entry.last_seen -= by;
         }
@@ -3573,7 +3571,7 @@ mod tests {
         reg.end("ended", None, None);
         reg.report_window(window_report("w1", "/p", true));
 
-        jump_wall_clock_forward(&reg, chrono::Duration::days(3));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(24 * 3));
 
         let ids: Vec<String> = reg.list().into_iter().map(|s| s.session_id).collect();
         assert_eq!(
@@ -3587,7 +3585,9 @@ mod tests {
         );
         assert_eq!(reg.lock_windows().len(), 1, "nor a window report");
         // Display still reads the wall clock: the stale `last_seen` is shown.
-        assert!(reg.list()[0].last_seen < Utc::now() - chrono::Duration::days(2));
+        assert!(
+            reg.list()[0].last_seen < Timestamp::now() - jiff::SignedDuration::from_hours(24 * 2)
+        );
     }
 
     #[test]
@@ -3610,7 +3610,7 @@ mod tests {
         let reg = SessionsRegistry::new();
         reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
         reg.clock.advance(just_inside_the_ttl());
-        jump_wall_clock_forward(&reg, chrono::Duration::hours(8));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(8));
         // A hook after the wake-up refreshes the awake stamp as well.
         reg.observe(observe_request("s1", SessionEvent::PostToolUse, None));
         reg.clock.advance(just_inside_the_ttl());
@@ -3619,7 +3619,7 @@ mod tests {
 
     // --- Stamped events: dedupe and ordering across socket and journal (#2108) --
 
-    fn at(ts: &str) -> DateTime<Utc> {
+    fn at(ts: &str) -> Timestamp {
         ts.parse().unwrap()
     }
 
@@ -3771,7 +3771,7 @@ mod tests {
     #[test]
     fn a_journal_event_keeps_its_own_timestamp_but_not_its_own_age() {
         let reg = SessionsRegistry::new();
-        let long_ago = Utc::now() - chrono::Duration::hours(2);
+        let long_ago = Timestamp::now() - jiff::SignedDuration::from_hours(2);
         let st = EventStamp {
             ts: long_ago,
             seq: "1-a".to_string(),
@@ -3795,7 +3795,7 @@ mod tests {
     #[test]
     fn a_journal_timestamp_in_the_future_is_clamped_to_now() {
         let reg = SessionsRegistry::new();
-        let future = Utc::now() + chrono::Duration::hours(1);
+        let future = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         reg.observe_stamped(
             observe_request("s", SessionEvent::Stop, Some("/p")),
             Some(EventStamp {
@@ -3804,7 +3804,7 @@ mod tests {
             }),
             Origin::Journal,
         );
-        assert!(reg.list()[0].last_seen <= Utc::now());
+        assert!(reg.list()[0].last_seen <= Timestamp::now());
     }
 
     #[test]

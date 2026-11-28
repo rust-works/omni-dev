@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -72,7 +72,7 @@ struct Event {
     /// Top-level `.type` value, captured verbatim.
     kind: String,
     /// `.timestamp` parsed as RFC 3339 when available.
-    timestamp: Option<DateTime<Utc>>,
+    timestamp: Option<Timestamp>,
     /// The full event JSON, retained so renderers can pull arbitrary fields.
     raw: Value,
 }
@@ -109,10 +109,8 @@ fn parse_events(jsonl_bytes: &[u8]) -> Vec<Event> {
     out
 }
 
-fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+fn parse_rfc3339(s: &str) -> Option<Timestamp> {
+    s.parse::<jiff::Timestamp>().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -193,8 +191,8 @@ fn last_string_field(events: &[Event], kinds: &[&str], field: &str) -> Option<St
         .find_map(|e| e.raw.get(field).and_then(Value::as_str).map(str::to_string))
 }
 
-fn format_ts(ts: DateTime<Utc>) -> String {
-    ts.to_rfc3339_opts(SecondsFormat::Secs, true)
+fn format_ts(ts: Timestamp) -> String {
+    crate::utils::time::rfc3339_secs(ts)
 }
 
 // ---------------------------------------------------------------------------

@@ -11,8 +11,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 use crate::github_metrics::{self, source_str, Category, GhCounts};
 use crate::request_log::{self, LogRecord, RecordKind, Source};
@@ -219,8 +219,8 @@ impl LogCounts {
 /// on a bad log.
 fn aggregate(
     path: &Path,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
+    until: Option<Timestamp>,
     source: Option<Source>,
     kind: Option<RecordKind>,
 ) -> LogCounts {
@@ -342,10 +342,8 @@ mod tests {
         f
     }
 
-    fn utc(ts: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(ts)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn utc(ts: &str) -> Timestamp {
+        ts.parse::<jiff::Timestamp>().unwrap()
     }
 
     #[test]

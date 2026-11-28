@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use clap::{ArgGroup, Parser, ValueEnum};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
@@ -214,7 +214,7 @@ pub async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> 
     let manifest_entries: Arc<Mutex<BTreeMap<String, ManifestEntry>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
 
-    let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    let timestamp = Timestamp::now().strftime("%Y-%m-%dT%H-%M-%S").to_string();
     let backup_dir = params.output_dir.join(".backups").join(&timestamp);
 
     let title_filter = params.title_filter.as_ref().map(|s| s.to_lowercase());

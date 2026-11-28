@@ -19,7 +19,7 @@
 //! "definitely still this process") never causes an end or an exemption — see
 //! [`super::pid_watcher`]'s `plan` for how each is used.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// Whether a process with this pid currently exists.
 ///
@@ -103,7 +103,7 @@ pub(crate) fn process_start_token(_pid: u32) -> Option<String> {
 /// after a daemon restart (#2108) has no earlier token to compare against, so it
 /// asks instead whether the process was already running when the journal's first
 /// event from that pid was written. A recycled pid started later, and fails.
-pub(crate) fn process_start_time(pid: u32) -> Option<DateTime<Utc>> {
+pub(crate) fn process_start_time(pid: u32) -> Option<Timestamp> {
     #[cfg(target_os = "macos")]
     {
         parse_ps_lstart(&process_start_token(pid)?)
@@ -124,10 +124,9 @@ pub(crate) fn process_start_time(pid: u32) -> Option<DateTime<Utc>> {
 /// Parses `ps -o lstart=` output (`Sat Oct  3 15:16:52 2026`), which
 /// [`process_start_token`] reads under `TZ=UTC`, so it is a UTC instant.
 #[cfg(any(target_os = "macos", test))]
-fn parse_ps_lstart(text: &str) -> Option<DateTime<Utc>> {
-    chrono::NaiveDateTime::parse_from_str(text.trim(), "%a %b %e %H:%M:%S %Y")
-        .ok()
-        .map(|naive| naive.and_utc())
+fn parse_ps_lstart(text: &str) -> Option<Timestamp> {
+    let civil = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", text.trim()).ok()?;
+    jiff::tz::Offset::UTC.to_timestamp(civil).ok()
 }
 
 /// The `starttime` field of a `/proc/<pid>/stat` line: clock ticks since boot.
@@ -157,10 +156,10 @@ fn boot_time_secs(proc_stat: &str) -> Option<i64> {
 /// A process's start time from the boot time and its `starttime` ticks.
 /// `USER_HZ`, the unit of `/proc` tick counts, is 100 on every Linux ABI.
 #[cfg(any(target_os = "linux", test))]
-fn proc_start_time(boot_secs: i64, ticks: u64) -> Option<DateTime<Utc>> {
+fn proc_start_time(boot_secs: i64, ticks: u64) -> Option<Timestamp> {
     const USER_HZ: u64 = 100;
     let secs = boot_secs.checked_add(i64::try_from(ticks / USER_HZ).ok()?)?;
-    DateTime::from_timestamp(secs, 0)
+    Timestamp::from_second(secs).ok()
 }
 
 #[cfg(test)]
@@ -198,7 +197,10 @@ mod tests {
     #[test]
     fn ps_lstart_is_parsed_as_utc() {
         let parsed = parse_ps_lstart("Sat Oct  3 15:16:52 2026\n").unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-10-03T15:16:52+00:00");
+        assert_eq!(
+            crate::utils::time::rfc3339_offset(parsed),
+            "2026-10-03T15:16:52+00:00"
+        );
         // A two-digit day parses too, and junk does not.
         assert!(parse_ps_lstart("Mon Oct 12 01:02:03 2026").is_some());
         assert!(parse_ps_lstart("").is_none());
@@ -218,7 +220,7 @@ mod tests {
         );
         assert_eq!(boot_time_secs("cpu 1 2 3\n"), None);
         assert_eq!(
-            proc_start_time(1_790_000_000, 250).unwrap().timestamp(),
+            proc_start_time(1_790_000_000, 250).unwrap().as_second(),
             1_790_000_002
         );
         assert!(proc_start_time(i64::MAX, 100).is_none());
@@ -228,12 +230,12 @@ mod tests {
     #[test]
     fn this_process_started_in_the_past() {
         let started = process_start_time(std::process::id()).expect("a start time");
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(
-            started <= now + chrono::Duration::seconds(2),
+            started <= now + jiff::SignedDuration::from_secs(2),
             "{started} vs {now}"
         );
-        assert!(started > now - chrono::Duration::days(365));
+        assert!(started > now - jiff::SignedDuration::from_hours(24 * 365));
     }
 
     #[cfg(unix)]

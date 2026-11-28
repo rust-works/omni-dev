@@ -1,8 +1,8 @@
 //! CLI command for `omni-dev datadog events list`.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 use crate::cli::datadog::events::{render_event_table, EventRow};
 use crate::cli::datadog::format::{output_as, OutputFormat};
@@ -78,9 +78,7 @@ fn resolve_time_range(from: &str, to: &str) -> Result<(String, String)> {
 }
 
 fn epoch_to_rfc3339(seconds: i64) -> String {
-    DateTime::<Utc>::from_timestamp(seconds, 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+    crate::utils::time::rfc3339_secs(Timestamp::from_second(seconds).unwrap_or_default())
 }
 
 /// Fetches the events list and emits it in the requested format.

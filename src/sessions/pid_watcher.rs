@@ -66,7 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -110,7 +110,7 @@ enum Action {
 }
 
 impl Action {
-    fn apply(self, registry: &SessionsRegistry, now: DateTime<Utc>) {
+    fn apply(self, registry: &SessionsRegistry, now: Timestamp) {
         match self {
             Self::End { session_id } => {
                 tracing::debug!(%session_id, reason = "pid_liveness", "session_process_ended");
@@ -157,7 +157,7 @@ fn plan(
     // `last_seen` (not `started_at`) is what lets a later `/resume` of the
     // older session_id correctly reclaim this over one `/clear` merely created
     // more recently but which has since gone quiet.
-    let mut most_recently_seen: HashMap<u32, DateTime<Utc>> = HashMap::new();
+    let mut most_recently_seen: HashMap<u32, Timestamp> = HashMap::new();
     for c in candidates {
         most_recently_seen
             .entry(c.pid)
@@ -229,7 +229,7 @@ pub(crate) fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -
             .await
             .unwrap_or_else(|_| (HashSet::new(), Vec::new()));
             confirmed = returned;
-            let now = Utc::now();
+            let now = Timestamp::now();
             for action in actions {
                 action.apply(&registry, now);
             }
@@ -259,7 +259,7 @@ mod tests {
             pid_start: pid_start.map(str::to_string),
             prompted,
             streamed: false,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         }
     }
 
@@ -366,7 +366,7 @@ mod tests {
         // The `/clear`-style guard: an abandoned session_id under a pid a
         // newer one has since taken over falls back to the ordinary TTL.
         let mut old = candidate("old", 100, Some("tok"), true);
-        old.last_seen = Utc::now() - chrono::Duration::seconds(100);
+        old.last_seen = Timestamp::now() - jiff::SignedDuration::from_secs(100);
         let new = candidate("new", 100, Some("tok"), true);
         let candidates = vec![old, new];
         let mut confirmed = HashSet::new();
@@ -394,7 +394,7 @@ mod tests {
         // abandoned `new` forever; `last_seen` correctly follows the activity.
         let old = candidate("old", 100, Some("tok"), true);
         let mut new = candidate("new", 100, Some("tok"), true);
-        new.last_seen = Utc::now() - chrono::Duration::seconds(100);
+        new.last_seen = Timestamp::now() - jiff::SignedDuration::from_secs(100);
         let candidates = vec![old, new];
         let mut confirmed = HashSet::new();
         let probe = probe_of(&HashMap::from([(
@@ -511,7 +511,7 @@ mod tests {
             Action::End {
                 session_id: "s1".to_string(),
             }
-            .apply(&registry, Utc::now());
+            .apply(&registry, Timestamp::now());
         });
         assert!(logs.contains("session_process_ended"), "{logs}");
         assert!(logs.contains("pid_liveness"), "{logs}");
@@ -526,7 +526,7 @@ mod tests {
             session_id: "s1".to_string(),
             pid_start: "tok".to_string(),
         }
-        .apply(&registry, Utc::now());
+        .apply(&registry, Timestamp::now());
         let candidates = registry.pid_liveness_candidates();
         assert_eq!(candidates[0].pid_start.as_deref(), Some("tok"));
     }

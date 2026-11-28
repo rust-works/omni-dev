@@ -5,7 +5,6 @@
 //! blocks, blockquotes, horizontal rules, and tables.
 
 use anyhow::{bail, Result};
-use chrono::NaiveDate;
 use tracing::{debug, warn};
 
 use crate::atlassian::adf::{AdfDocument, AdfMark, AdfNode};
@@ -1552,11 +1551,8 @@ fn iso_date_to_epoch_ms(date_str: &str) -> String {
     if date_str.chars().all(|c| c.is_ascii_digit()) {
         return date_str.to_string();
     }
-    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-        let epoch_ms = date
-            .and_hms_opt(0, 0, 0)
-            .map_or(0, |dt| dt.and_utc().timestamp_millis());
-        epoch_ms.to_string()
+    if let Ok(midnight) = crate::utils::time::parse_date_as_utc_midnight(date_str) {
+        midnight.as_millisecond().to_string()
     } else {
         // Fallback: pass through as-is
         date_str.to_string()
@@ -1572,8 +1568,8 @@ fn epoch_ms_to_iso_date(timestamp: &str) -> String {
     }
     if let Ok(ms) = timestamp.parse::<i64>() {
         let secs = ms / 1000;
-        if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
-            return dt.format("%Y-%m-%d").to_string();
+        if let Ok(ts) = jiff::Timestamp::from_second(secs) {
+            return ts.strftime("%Y-%m-%d").to_string();
         }
     }
     // Fallback: pass through

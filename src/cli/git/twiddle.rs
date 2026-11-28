@@ -2865,7 +2865,7 @@ mod tests {
         let commit = CommitInfo {
             hash: hash.to_string(),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: format!("feat: commit {hash}"),
             in_main_branches: vec![],
             analysis: CommitAnalysis {

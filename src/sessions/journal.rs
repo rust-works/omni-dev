@@ -31,7 +31,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 pub use super::is_session_uuid;
@@ -60,7 +60,8 @@ pub struct JournalRecord {
     /// The format version, [`RECORD_VERSION`].
     pub v: u32,
     /// When the hook fired (see [`EventStamp::ts`]).
-    pub ts: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub ts: Timestamp,
     /// The event's nonce (see [`EventStamp::seq`]).
     pub seq: String,
     /// Which agent's hook wrote it; also names the journal's directory.
@@ -212,13 +213,9 @@ impl JournalRecord {
 /// A fresh stamp for an event firing now.
 #[must_use]
 pub fn new_stamp() -> EventStamp {
-    let ts = Utc::now();
+    let ts = Timestamp::now();
     EventStamp {
-        seq: format!(
-            "{}-{}",
-            std::process::id(),
-            ts.timestamp_nanos_opt().unwrap_or_default()
-        ),
+        seq: format!("{}-{}", std::process::id(), ts.as_nanosecond()),
         ts,
     }
 }

@@ -33,7 +33,7 @@ use std::fs::{File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::{Filter, GhCounts};
 use crate::request_log::{self, LogRecord};
@@ -303,7 +303,7 @@ fn read_tail(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
 #[derive(Debug)]
 pub struct IncrementalCounts {
     path: PathBuf,
-    since: DateTime<Utc>,
+    since: Timestamp,
     filter: Filter,
     counts: GhCounts,
     /// `None` until a log file has been seen.
@@ -321,18 +321,18 @@ impl IncrementalCounts {
     /// after the clock read but appended before the baseline.
     pub fn start(path: PathBuf) -> Self {
         let cursor = Cursor::baseline(&path);
-        Self::new(path, Utc::now(), cursor)
+        Self::new(path, Timestamp::now(), cursor)
     }
 
     /// [`start`](Self::start) with the window opening at `since` instead of now,
     /// so tests can stamp their records deterministically.
     #[cfg(test)]
-    fn start_since(path: PathBuf, since: DateTime<Utc>) -> Self {
+    fn start_since(path: PathBuf, since: Timestamp) -> Self {
         let cursor = Cursor::baseline(&path);
         Self::new(path, since, cursor)
     }
 
-    fn new(path: PathBuf, since: DateTime<Utc>, cursor: Option<Cursor>) -> Self {
+    fn new(path: PathBuf, since: Timestamp, cursor: Option<Cursor>) -> Self {
         Self {
             path,
             since,
@@ -347,7 +347,7 @@ impl IncrementalCounts {
     }
 
     /// The instant the window opened: records stamped before it are not counted.
-    pub fn since(&self) -> DateTime<Utc> {
+    pub fn since(&self) -> Timestamp {
         self.since
     }
 
@@ -603,18 +603,18 @@ impl IncrementalCounts {
 mod tests {
     use super::*;
     use crate::github_metrics::aggregate;
-    use chrono::{Duration, SecondsFormat};
+    use jiff::Timestamp;
     use std::io::Write;
 
-    fn since() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-07-21T10:00:00.000Z")
+    fn since() -> Timestamp {
+        "2026-07-21T10:00:00.000Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .with_timezone(&Utc)
     }
 
     /// An RFC3339 stamp `secs` seconds after [`since`] (negative: before it).
     fn stamp(secs: i64) -> String {
-        (since() + Duration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Millis, true)
+        crate::utils::time::rfc3339_millis(since() + jiff::SignedDuration::from_secs(secs))
     }
 
     /// A `gh` record line, newline-terminated.

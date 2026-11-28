@@ -676,7 +676,7 @@ mod tests {
             source: SessionSourceRow::Terminal,
             model: None,
             agent: "Claude".to_string(),
-            last_seen: chrono::Utc::now(),
+            last_seen: jiff::Timestamp::now(),
         };
         // The most demanding state on the row wins: one waiting session
         // among idle ones still reads as waiting.
@@ -700,14 +700,14 @@ mod tests {
 
     #[test]
     fn the_sessions_summary_names_the_latest_sessions_agent() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let badge = |agent: &str, model: Option<&str>, age: i64| SessionBadge {
             session_id: "s".to_string(),
             state: SessionState::Working,
             source: SessionSourceRow::Terminal,
             model: model.map(str::to_string),
             agent: agent.to_string(),
-            last_seen: now - chrono::Duration::seconds(age),
+            last_seen: now - jiff::SignedDuration::from_secs(age),
         };
         assert_eq!(
             sessions_summary(&[

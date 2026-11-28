@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
@@ -51,7 +51,7 @@ pub struct VideoEntry {
     /// 11-character YouTube video ID.
     pub id: String,
     /// Publish timestamp, when the enumeration source provides one.
-    pub published: Option<DateTime<Utc>>,
+    pub published: Option<Timestamp>,
 }
 
 /// Resolve a channel locator to its canonical `UC…` ID.
@@ -253,8 +253,7 @@ fn parse_rss(xml: &str) -> Vec<VideoEntry> {
             let published = rss_published_regex()
                 .captures(block)
                 .and_then(|c| c.get(1))
-                .and_then(|m| DateTime::parse_from_rfc3339(m.as_str()).ok())
-                .map(|dt| dt.with_timezone(&Utc));
+                .and_then(|m| m.as_str().parse::<jiff::Timestamp>().ok());
             Some(VideoEntry { id, published })
         })
         .collect()

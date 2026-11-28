@@ -9,29 +9,29 @@
 //! All results are returned as epoch seconds (`i64`) — the unit expected
 //! by Datadog v1 query parameters.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::datadog::error::DatadogError;
 
 /// Parses a single time instant relative to `now`.
 ///
 /// Returns Unix epoch seconds. See module docs for accepted syntax.
-pub fn parse_instant(spec: &str, now: DateTime<Utc>) -> Result<i64, DatadogError> {
+pub fn parse_instant(spec: &str, now: Timestamp) -> Result<i64, DatadogError> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Err(DatadogError::InvalidTimeRange("empty".to_string()));
     }
 
     if spec.eq_ignore_ascii_case("now") {
-        return Ok(now.timestamp());
+        return Ok(now.as_second());
     }
 
     if let Some(seconds) = parse_relative(spec) {
-        return Ok(now.timestamp() - seconds as i64);
+        return Ok(now.as_second() - seconds as i64);
     }
 
-    if let Ok(ts) = DateTime::parse_from_rfc3339(spec) {
-        return Ok(ts.timestamp());
+    if let Ok(ts) = spec.parse::<jiff::Timestamp>() {
+        return Ok(ts.as_second());
     }
 
     if let Ok(secs) = spec.parse::<i64>() {
@@ -45,11 +45,11 @@ pub fn parse_instant(spec: &str, now: DateTime<Utc>) -> Result<i64, DatadogError
 
 /// Parses a `(from, to)` pair. When `to` is `None`, defaults to `now`.
 pub fn parse_time_range(from: &str, to: Option<&str>) -> Result<(i64, i64), DatadogError> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let from_ts = parse_instant(from, now)?;
     let to_ts = match to {
         Some(spec) => parse_instant(spec, now)?,
-        None => now.timestamp(),
+        None => now.as_second(),
     };
     if to_ts < from_ts {
         return Err(DatadogError::InvalidTimeRange(format!(
@@ -83,41 +83,41 @@ fn parse_relative(spec: &str) -> Option<u64> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use jiff::Timestamp;
 
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap()
+    fn now() -> Timestamp {
+        "2026-04-22T12:00:00Z".parse::<jiff::Timestamp>().unwrap()
     }
 
     #[test]
     fn parses_now() {
-        assert_eq!(parse_instant("now", now()).unwrap(), now().timestamp());
+        assert_eq!(parse_instant("now", now()).unwrap(), now().as_second());
     }
 
     #[test]
     fn parses_now_case_insensitive() {
-        assert_eq!(parse_instant("NOW", now()).unwrap(), now().timestamp());
-        assert_eq!(parse_instant("Now", now()).unwrap(), now().timestamp());
+        assert_eq!(parse_instant("NOW", now()).unwrap(), now().as_second());
+        assert_eq!(parse_instant("Now", now()).unwrap(), now().as_second());
     }
 
     #[test]
     fn parses_relative_minutes() {
         assert_eq!(
             parse_instant("15m", now()).unwrap(),
-            now().timestamp() - 15 * 60
+            now().as_second() - 15 * 60
         );
     }
 
     #[test]
     fn parses_relative_seconds() {
-        assert_eq!(parse_instant("30s", now()).unwrap(), now().timestamp() - 30);
+        assert_eq!(parse_instant("30s", now()).unwrap(), now().as_second() - 30);
     }
 
     #[test]
     fn parses_relative_hours() {
         assert_eq!(
             parse_instant("2h", now()).unwrap(),
-            now().timestamp() - 2 * 60 * 60
+            now().as_second() - 2 * 60 * 60
         );
     }
 
@@ -125,7 +125,7 @@ mod tests {
     fn parses_relative_days() {
         assert_eq!(
             parse_instant("3d", now()).unwrap(),
-            now().timestamp() - 3 * 24 * 60 * 60
+            now().as_second() - 3 * 24 * 60 * 60
         );
     }
 
@@ -133,16 +133,16 @@ mod tests {
     fn parses_relative_weeks() {
         assert_eq!(
             parse_instant("1w", now()).unwrap(),
-            now().timestamp() - 7 * 24 * 60 * 60
+            now().as_second() - 7 * 24 * 60 * 60
         );
     }
 
     #[test]
     fn parses_rfc3339_utc() {
-        let expected = Utc
-            .with_ymd_and_hms(2026, 4, 22, 10, 0, 0)
+        let expected = "2026-04-22T10:00:00Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .timestamp();
+            .as_second();
         assert_eq!(
             parse_instant("2026-04-22T10:00:00Z", now()).unwrap(),
             expected
@@ -151,10 +151,10 @@ mod tests {
 
     #[test]
     fn parses_rfc3339_with_offset() {
-        let expected = Utc
-            .with_ymd_and_hms(2026, 4, 22, 9, 0, 0)
+        let expected = "2026-04-22T09:00:00Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .timestamp();
+            .as_second();
         assert_eq!(
             parse_instant("2026-04-22T10:00:00+01:00", now()).unwrap(),
             expected

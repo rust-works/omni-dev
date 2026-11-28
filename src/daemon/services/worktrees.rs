@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::git::remote::RemoteInfo;
 use crate::git::worktree_batch::Selection;
@@ -926,9 +926,9 @@ impl WorktreesService {
             let (mut watched, mut last_poll): (Option<Vec<PrWatch>>, Option<Instant>) =
                 match warm_start {
                     Some(ws) => {
-                        let elapsed = (Utc::now() - ws.polled_at)
-                            .to_std()
-                            .unwrap_or(Duration::ZERO);
+                        let elapsed =
+                            Duration::try_from(Timestamp::now().duration_since(ws.polled_at))
+                                .unwrap_or(Duration::ZERO);
                         (Some(ws.watched), Instant::now().checked_sub(elapsed))
                     }
                     None => (None, None),
@@ -1096,7 +1096,7 @@ impl WorktreesService {
                             path,
                             &pr_cache,
                             watched.as_deref().unwrap_or(&[]),
-                            Utc::now(),
+                            Timestamp::now(),
                         );
                     }
                 }
@@ -1325,7 +1325,7 @@ impl WorktreesService {
             // offered back (#2211).
             let capture = req.path.clone();
             let closed = tokio::task::spawn_blocking(move || {
-                closed::closed_worktree_for(&capture, Utc::now())
+                closed::closed_worktree_for(&capture, Timestamp::now())
             })
             .await
             .unwrap_or(None);
@@ -2250,7 +2250,8 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PollingLease {
     repo: String,
-    expires_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    expires_at: Timestamp,
 }
 
 /// The on-disk shape of the per-repo PR-poll prefs (#1376): the live leases whose
@@ -2334,8 +2335,12 @@ struct PrCachePrefs {
     entries: Vec<PersistedEntry>,
     #[serde(default)]
     watched: Vec<PersistedWatch>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    polled_at: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::utils::time::serde_rfc3339::option"
+    )]
+    polled_at: Option<Timestamp>,
 }
 
 impl PersistedResolution {
@@ -2373,7 +2378,7 @@ impl PersistedResolution {
 fn pr_cache_prefs_from(
     entries: Vec<(PrTarget, PrResolution)>,
     watched: &[PrWatch],
-    polled_at: DateTime<Utc>,
+    polled_at: Timestamp,
 ) -> PrCachePrefs {
     let mut entries: Vec<PersistedEntry> = entries
         .into_iter()
@@ -2419,7 +2424,7 @@ fn persist_pr_cache(
     path: &Path,
     pr_cache: &PrStatusCache,
     watched: &[PrWatch],
-    polled_at: DateTime<Utc>,
+    polled_at: Timestamp,
 ) {
     let prefs = pr_cache_prefs_from(pr_cache.entries(), watched, polled_at);
     if let Err(err) = write_pr_cache(path, &prefs) {
@@ -2439,7 +2444,7 @@ struct PrWarmStart {
     watched: Vec<PrWatch>,
     /// When those verdicts were resolved, used to age the warm start against the
     /// backoff (a stale-enough file just re-polls).
-    polled_at: DateTime<Utc>,
+    polled_at: Timestamp,
 }
 
 // --- Shared open-PR cache for the daemon-served "Open PR" op (#1389, fix 7) -----
@@ -5791,7 +5796,7 @@ mod tests {
             repo: Some("my-repo".to_string()),
             title: None,
             pid: None,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
             last_active: Duration::ZERO,
         };
         assert_eq!(display_name(&base), "my-repo");
@@ -5821,7 +5826,7 @@ mod tests {
 
     #[test]
     fn window_menu_items_merge_stats_and_focus_into_one_clickable_line() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let entries = vec![
             // A folderless window has nothing to focus, so it stays a plain
             // Label; a title equal to the name collapses to just the name. It
@@ -6384,7 +6389,7 @@ mod tests {
         svc.registry.set_polling_expiry(
             "rust-works",
             "omni-dev",
-            Utc::now() - chrono::Duration::minutes(1),
+            Timestamp::now() - jiff::SignedDuration::from_mins(1),
         );
 
         let snap = svc.handle("tree", Value::Null).await.unwrap();
@@ -8316,9 +8321,7 @@ mod tests {
             head_oid: "deadbeef".into(),
         });
         let watched = vec![watch("main", Some("abc"))];
-        let polled_at = DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let polled_at = "2026-07-21T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let prefs = pr_cache_prefs_from(vec![(target, badge.clone())], &watched, polled_at);
 
         let json = serde_json::to_vec(&prefs).unwrap();
@@ -8340,7 +8343,7 @@ mod tests {
             name: "omni-dev".into(),
             branch: "feature".into(),
         };
-        let prefs = pr_cache_prefs_from(vec![(target, PrResolution::NoPr)], &[], Utc::now());
+        let prefs = pr_cache_prefs_from(vec![(target, PrResolution::NoPr)], &[], Timestamp::now());
         let json = serde_json::to_vec(&prefs).unwrap();
         let back: PrCachePrefs = serde_json::from_slice(&json).unwrap();
         assert_eq!(back.entries[0].resolution, PersistedResolution::NoPr);
@@ -8366,7 +8369,7 @@ mod tests {
         let mut prefs = pr_cache_prefs_from(
             vec![(target, PrResolution::Pr(pending_badge(7, "abc")))],
             &[watch("main", None)],
-            Utc::now(),
+            Timestamp::now(),
         );
         prefs.polled_at = None;
         write_pr_cache(&path, &prefs).unwrap();
@@ -8437,11 +8440,11 @@ mod tests {
         std::fs::write(&blocker, b"").unwrap();
         // The parent is a regular file, so creating the runtime dir must fail.
         let path = blocker.join("pr-cache.json");
-        persist_pr_cache(&path, &PrStatusCache::new(), &[], Utc::now());
+        persist_pr_cache(&path, &PrStatusCache::new(), &[], Timestamp::now());
         assert!(!path.exists());
         // The root has no parent at all — nothing to create, and the write
         // itself fails (it is a directory); still swallowed.
-        persist_pr_cache(Path::new("/"), &PrStatusCache::new(), &[], Utc::now());
+        persist_pr_cache(Path::new("/"), &PrStatusCache::new(), &[], Timestamp::now());
     }
 
     #[tokio::test]
@@ -9525,7 +9528,7 @@ mod tests {
         let prefs = pr_cache_prefs_from(
             vec![(target, PrResolution::Pr(pending_badge(1337, &head)))],
             &[watch("main", None)],
-            Utc::now(),
+            Timestamp::now(),
         );
         write_pr_cache(&cache_path, &prefs).unwrap();
 
@@ -9741,7 +9744,7 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(PrWarmStart {
             watched: vec![],
-            polled_at: Utc::now(),
+            polled_at: Timestamp::now(),
         });
         // Budget over the warn threshold before the poller starts.
         svc.rate_limit_cache.replace(RateLimitSnapshot {
@@ -9958,7 +9961,7 @@ mod tests {
             repo: Some("companion-repo".to_string()),
             title: Some("ignored title".to_string()),
             pid: None,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
             last_active: Duration::ZERO,
         };
         // Main checkout: `repo · branch`, and with no upstream there is no sync.
@@ -9999,7 +10002,7 @@ mod tests {
             repo: Some("companion-repo".to_string()),
             title: None,
             pid: None,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
             last_active: Duration::ZERO,
         };
         // A tracking branch appends the `(+ahead -behind)` sync indicator.
@@ -10065,7 +10068,7 @@ mod tests {
             repo: Some("feature-wt".to_string()),
             title: None,
             pid: None,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
             last_active: Duration::ZERO,
         };
         // A worktree line: parent repo, the fork glyph, then the branch (no
@@ -12021,7 +12024,7 @@ mod tests {
             repo: None,
             title: None,
             pid: None,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
             last_active: Duration::ZERO,
         }
     }

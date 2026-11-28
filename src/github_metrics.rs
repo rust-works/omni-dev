@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::request_log::{self, GhOutcome, LogRecord, RecordKind, Source};
 
@@ -214,8 +214,8 @@ impl GhCounts {
 #[must_use]
 pub fn aggregate(
     path: &Path,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
+    until: Option<Timestamp>,
     source: Option<Source>,
 ) -> GhCounts {
     let mut counts = GhCounts::default();
@@ -248,8 +248,8 @@ pub fn aggregate(
 /// started), so the two cannot disagree about what counts.
 #[derive(Debug, Clone, Copy)]
 struct Filter {
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
+    until: Option<Timestamp>,
     source: Option<Source>,
 }
 
@@ -278,10 +278,8 @@ impl Filter {
 /// Parses a record's RFC3339 timestamp to UTC, or `None` when unparseable.
 /// Shared with `omni-dev log count`'s generic aggregator so both windows records
 /// identically.
-pub(crate) fn parse_timestamp(ts: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+pub(crate) fn parse_timestamp(ts: &str) -> Option<Timestamp> {
+    ts.parse::<jiff::Timestamp>().ok()
 }
 
 #[cfg(test)]
@@ -341,10 +339,8 @@ mod tests {
         f
     }
 
-    fn utc(ts: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(ts)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn utc(ts: &str) -> Timestamp {
+        ts.parse::<jiff::Timestamp>().unwrap()
     }
 
     #[test]

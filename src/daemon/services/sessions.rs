@@ -556,7 +556,7 @@ mod tests {
             crate::daemon::paths::sessions_journal_dir_for_socket(&tmp.path().join("daemon.sock"));
         let id = "0b7e6c1a-2f4d-4a8e-9c3b-5d1e7f9a2b4c";
         let stamp = EventStamp {
-            ts: chrono::Utc::now() - chrono::Duration::seconds(15),
+            ts: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(15),
             seq: "7-1".to_string(),
         };
         let req = ObserveRequest {
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn menu_item_is_clickable_only_for_vscode_sessions() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let base = |source: Source| SessionEntry {
             subagent_base: None,
             subagent_waits: std::collections::HashMap::new(),
@@ -835,7 +835,7 @@ mod tests {
 
     /// Builds a session entry for the pure menu/label tests.
     fn entry(id: &str, state: SessionState, repo: Option<&str>, cwd: Option<&str>) -> SessionEntry {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         SessionEntry {
             subagent_base: None,
             subagent_waits: std::collections::HashMap::new(),

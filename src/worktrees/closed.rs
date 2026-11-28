@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// The most entries kept.
@@ -76,7 +76,8 @@ pub struct ClosedWorktree {
     #[serde(default)]
     pub removed: bool,
     /// When the closure was observed.
-    pub closed_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub closed_at: Timestamp,
 }
 
 /// The bounded, newest-first list of closures. Not thread-safe by itself: the
@@ -91,7 +92,7 @@ impl ClosedLog {
     /// Builds a log from `entries` (a persisted file's contents, in any order),
     /// keeping the newest per path and applying both bounds as of `now`.
     #[must_use]
-    pub fn from_entries(entries: Vec<ClosedWorktree>, now: DateTime<Utc>) -> Self {
+    pub fn from_entries(entries: Vec<ClosedWorktree>, now: Timestamp) -> Self {
         let mut log = Self::default();
         for entry in entries {
             log.insert(entry);
@@ -114,7 +115,7 @@ impl ClosedLog {
 
     /// Records a closure, replacing any earlier one for the same path, then
     /// applies both bounds as of `now`. Returns whether the list changed.
-    pub fn record(&mut self, entry: ClosedWorktree, now: DateTime<Utc>) -> bool {
+    pub fn record(&mut self, entry: ClosedWorktree, now: Timestamp) -> bool {
         let before = self.entries.clone();
         self.insert(entry);
         self.prune(now);
@@ -143,9 +144,9 @@ impl ClosedLog {
 
     /// Applies both bounds as of `now`: entries older than [`MAX_AGE_DAYS`] go,
     /// then the oldest beyond [`MAX_CLOSED`]. Returns whether anything went.
-    pub fn prune(&mut self, now: DateTime<Utc>) -> bool {
+    pub fn prune(&mut self, now: Timestamp) -> bool {
         let before = self.entries.len();
-        let oldest_kept = now - ChronoDuration::days(MAX_AGE_DAYS);
+        let oldest_kept = now - jiff::SignedDuration::from_hours(24 * MAX_AGE_DAYS);
         self.entries.retain(|e| e.closed_at >= oldest_kept);
         // Newest first, so the tail is the oldest.
         self.entries.truncate(MAX_CLOSED);
@@ -206,7 +207,7 @@ pub fn from_file_bytes(bytes: &[u8]) -> Result<Vec<ClosedWorktree>> {
 mod tests {
     use super::*;
 
-    fn entry(path: &str, closed_at: DateTime<Utc>) -> ClosedWorktree {
+    fn entry(path: &str, closed_at: Timestamp) -> ClosedWorktree {
         ClosedWorktree {
             path: PathBuf::from(path),
             repo_root: PathBuf::from("/repo"),
@@ -220,12 +221,12 @@ mod tests {
         }
     }
 
-    fn now() -> DateTime<Utc> {
+    fn now() -> Timestamp {
         "2026-10-07T12:00:00Z".parse().unwrap()
     }
 
-    fn minutes_ago(n: i64) -> DateTime<Utc> {
-        now() - ChronoDuration::minutes(n)
+    fn minutes_ago(n: i64) -> Timestamp {
+        now() - jiff::SignedDuration::from_mins(n)
     }
 
     #[test]
@@ -299,13 +300,15 @@ mod tests {
     #[test]
     fn the_age_bound_drops_entries_older_than_the_limit() {
         let mut log = ClosedLog::default();
-        let old = now() - ChronoDuration::days(MAX_AGE_DAYS) - ChronoDuration::seconds(1);
-        let edge = now() - ChronoDuration::days(MAX_AGE_DAYS);
+        let old = now()
+            - jiff::SignedDuration::from_hours(24 * MAX_AGE_DAYS)
+            - jiff::SignedDuration::from_secs(1);
+        let edge = now() - jiff::SignedDuration::from_hours(24 * MAX_AGE_DAYS);
         log.record(entry("/old", old), now());
         log.record(entry("/edge", edge), now());
         assert_eq!(paths(&log), ["/edge"]);
         // Entries age out without a new record, too.
-        let later = now() + ChronoDuration::seconds(1);
+        let later = now() + jiff::SignedDuration::from_secs(1);
         assert!(log.prune(later));
         assert!(log.entries().is_empty());
     }
@@ -358,7 +361,7 @@ mod tests {
 
     #[test]
     fn from_entries_dedupes_orders_and_prunes() {
-        let stale = now() - ChronoDuration::days(MAX_AGE_DAYS + 1);
+        let stale = now() - jiff::SignedDuration::from_hours(24 * (MAX_AGE_DAYS + 1));
         let log = ClosedLog::from_entries(
             vec![
                 entry("/a", minutes_ago(4)),

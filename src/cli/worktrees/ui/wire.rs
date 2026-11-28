@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer};
 
 use crate::cli::format::sanitize_for_terminal;
@@ -165,7 +165,8 @@ pub struct SessionEntryWire {
     pub state: SessionState,
     #[serde(default = "default_source")]
     pub source: Source,
-    pub last_seen: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub last_seen: Timestamp,
 }
 
 fn default_source() -> Source {

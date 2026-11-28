@@ -1,8 +1,8 @@
 //! CLI command for `omni-dev datadog hosts list`.
 
 use anyhow::Result;
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 use crate::cli::datadog::format::{output_as, OutputFormat};
 use crate::cli::datadog::hosts::{render_host_table, HostRow};
@@ -84,9 +84,7 @@ fn host_row<'a>(h: &'a Host, last_reported: &'a str) -> HostRow<'a> {
 }
 
 fn epoch_to_rfc3339(seconds: i64) -> String {
-    DateTime::<Utc>::from_timestamp(seconds, 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+    crate::utils::time::rfc3339_secs(Timestamp::from_second(seconds).unwrap_or_default())
 }
 
 #[cfg(test)]

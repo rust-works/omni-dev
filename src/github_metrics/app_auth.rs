@@ -7,7 +7,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 use crate::utils::{
@@ -56,7 +56,7 @@ fn resolve(env: &impl EnvSource) -> io::Result<Option<Config>> {
 #[derive(Debug)]
 struct Token {
     value: Secret,
-    expires: DateTime<Utc>,
+    expires: Timestamp,
 }
 
 #[derive(Default)]
@@ -66,16 +66,16 @@ impl Cache {
     fn token(
         &mut self,
         config: &Config,
-        now: DateTime<Utc>,
+        now: Timestamp,
         mint: impl FnOnce() -> io::Result<Token>,
     ) -> io::Result<Secret> {
         if let Some((identity, token)) = &self.0 {
-            if identity == config && token.expires > now + chrono::Duration::minutes(5) {
+            if identity == config && token.expires > now + jiff::SignedDuration::from_mins(5) {
                 return Ok(token.value.clone());
             }
         }
         let token = mint()?;
-        if token.expires <= Utc::now() + chrono::Duration::minutes(5)
+        if token.expires <= Timestamp::now() + jiff::SignedDuration::from_mins(5)
             || token.value.expose_secret().is_empty()
         {
             return Err(error(
@@ -108,7 +108,7 @@ pub(super) fn configure(
     let value = CACHE
         .lock()
         .map_err(|_| error("GitHub App token cache lock poisoned"))?
-        .token(&config, Utc::now(), || mint(&config))?;
+        .token(&config, Timestamp::now(), || mint(&config))?;
     inject(cmd, &value);
     Ok(())
 }
@@ -170,7 +170,7 @@ fn mint(config: &Config) -> io::Result<Token> {
         std::fs::read_to_string(&config.key_path)
             .map_err(|_| error("cannot read OMNI_DEV_GITHUB_APP_PRIVATE_KEY_PATH"))?,
     );
-    let jwt = jwt(config.app, &pem, Utc::now().timestamp())?;
+    let jwt = jwt(config.app, &pem, Timestamp::now().as_second())?;
     exchange(
         &format!(
             "https://api.github.com/app/installations/{}/access_tokens",
@@ -218,9 +218,8 @@ fn exchange(url: &str, jwt: &Secret) -> io::Result<Token> {
         .ok_or_else(|| error("missing GitHub App installation token"))?;
     let expires = body["expires_at"]
         .as_str()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .ok_or_else(|| error("invalid GitHub App token expiry"))?
-        .with_timezone(&Utc);
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+        .ok_or_else(|| error("invalid GitHub App token expiry"))?;
     Ok(Token {
         value: Secret::new(token),
         expires,
@@ -257,7 +256,7 @@ mod tests {
     fn token(value: &str, minutes: i64) -> Token {
         Token {
             value: value.into(),
-            expires: Utc::now() + chrono::Duration::minutes(minutes),
+            expires: Timestamp::now() + jiff::SignedDuration::from_mins(minutes),
         }
     }
 
@@ -333,7 +332,7 @@ mod tests {
     fn cache_reuses_refreshes_and_separates_identities() {
         let config = resolve(&env()).unwrap().unwrap();
         let mut cache = Cache::default();
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert_eq!(
             cache
                 .token(&config, now, || Ok(token("first", 60)))
@@ -350,9 +349,9 @@ mod tests {
         );
         assert_eq!(
             cache
-                .token(&config, now + chrono::Duration::minutes(56), || Ok(token(
-                    "second", 60
-                )))
+                .token(&config, now + jiff::SignedDuration::from_mins(56), || Ok(
+                    token("second", 60)
+                ))
                 .unwrap()
                 .expose_secret(),
             "second"
@@ -374,9 +373,9 @@ mod tests {
         assert!(cache.token(&config, now, || Ok(token("", 60))).is_err());
         assert!(cache.token(&config, now, || Ok(token("short", 2))).is_err());
         assert!(cache
-            .token(&other, now + chrono::Duration::hours(2), || Err(error(
-                "offline"
-            )))
+            .token(&other, now + jiff::SignedDuration::from_hours(2), || Err(
+                error("offline")
+            ))
             .is_err());
     }
 
@@ -392,7 +391,7 @@ mod tests {
                     cache
                         .lock()
                         .unwrap()
-                        .token(&resolve(&env()).unwrap().unwrap(), Utc::now(), || {
+                        .token(&resolve(&env()).unwrap().unwrap(), Timestamp::now(), || {
                             calls.fetch_add(1, Ordering::SeqCst);
                             Ok(token("shared", 60))
                         })
@@ -469,10 +468,10 @@ mod tests {
 
     #[test]
     fn exchange_posts_jwt_and_parses_expiry() {
-        let expires = Utc::now() + chrono::Duration::hours(1);
+        let expires = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let (url, server) = mock(
             201,
-            json!({"token":"installation", "expires_at":expires.to_rfc3339()}).to_string(),
+            json!({"token":"installation", "expires_at":crate::utils::time::rfc3339_offset(expires)}).to_string(),
         );
         let token = exchange(&url, &"signed-jwt".into()).unwrap();
         assert_eq!(token.value.expose_secret(), "installation");

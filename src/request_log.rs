@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::env::{non_empty_var, truthy_var, EnvSource, SystemEnv};
@@ -985,7 +985,7 @@ pub struct PruneOptions {
     /// Drop records whose timestamp is strictly older than this cutoff. A
     /// record with a missing/unparseable timestamp (or a malformed line) is
     /// conservatively kept.
-    pub older_than: Option<DateTime<Utc>>,
+    pub older_than: Option<Timestamp>,
     /// After age pruning, drop the oldest records until the file is at most
     /// this many bytes. At least the single most recent record is always kept.
     pub max_size: Option<u64>,
@@ -1076,13 +1076,13 @@ pub fn prune(path: &Path, opts: &PruneOptions) -> anyhow::Result<PruneOutcome> {
 
 /// Whether a raw line survives the age filter. Absent filter keeps everything;
 /// an undateable or malformed line is conservatively kept.
-fn keep_by_age(line: &str, older_than: Option<DateTime<Utc>>) -> bool {
+fn keep_by_age(line: &str, older_than: Option<Timestamp>) -> bool {
     let Some(cutoff) = older_than else {
         return true;
     };
     match serde_json::from_str::<LogRecord>(line) {
-        Ok(rec) => match DateTime::parse_from_rfc3339(&rec.timestamp) {
-            Ok(ts) => ts.with_timezone(&Utc) >= cutoff,
+        Ok(rec) => match rec.timestamp.parse::<Timestamp>() {
+            Ok(ts) => ts >= cutoff,
             Err(_) => true,
         },
         Err(_) => true,
@@ -1627,14 +1627,14 @@ fn redact_url(url: &str) -> String {
 /// the uuid-shaped minting in [`crate::snowflake::client`] without adding a
 /// crate.
 pub fn new_id() -> String {
-    let millis = chrono::Utc::now().timestamp_millis().max(0);
+    let millis = jiff::Timestamp::now().as_millisecond().max(0);
     let suffix = rand::random::<u64>();
     format!("{millis:013}-{suffix:016x}")
 }
 
 /// Current time as RFC3339 with millisecond precision, in UTC.
 fn now_rfc3339_millis() -> String {
-    chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    crate::utils::time::rfc3339_millis(Timestamp::now())
 }
 
 /// Best-effort current working directory.
@@ -2466,9 +2466,9 @@ mod tests {
 
     #[test]
     fn keep_by_age_is_conservative_on_undateable_lines() {
-        let cutoff = DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let cutoff = "2026-06-01T00:00:00.000Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap();
         let old = r#"{"kind":"http","timestamp":"2026-01-01T00:00:00.000Z"}"#;
         let new = r#"{"kind":"http","timestamp":"2026-12-01T00:00:00.000Z"}"#;
         let undated = r#"{"kind":"http"}"#;
@@ -2500,9 +2500,9 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let cutoff = DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let cutoff = "2026-06-01T00:00:00.000Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap();
         let outcome = prune(
             &path,
             &PruneOptions {
@@ -2537,9 +2537,9 @@ mod tests {
         );
         std::fs::write(&path, &body).unwrap();
 
-        let cutoff = DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let cutoff = "2026-06-01T00:00:00.000Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap();
         let outcome = prune(
             &path,
             &PruneOptions {

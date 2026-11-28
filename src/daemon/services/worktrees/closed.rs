@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
 use git2::{BranchType, Repository, WorktreeAddOptions, WorktreePruneOptions};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -34,10 +34,7 @@ const UNCOMMITTED_WARNING: &str =
 /// *worktree*), or the repository has no working tree to name. The recorded path
 /// is the worktree's root, not the folder, so a window opened on a subdirectory
 /// reopens the worktree.
-pub(super) fn closed_worktree_for(
-    folder: &Path,
-    closed_at: DateTime<Utc>,
-) -> Option<ClosedWorktree> {
+pub(super) fn closed_worktree_for(folder: &Path, closed_at: Timestamp) -> Option<ClosedWorktree> {
     let repo = Repository::discover(folder).ok()?;
     let workdir = canonical(repo.workdir()?);
     // The common dir is shared by the main checkout and every linked worktree;
@@ -533,7 +530,7 @@ impl WorktreesService {
 mod tests {
     use std::sync::Mutex;
 
-    use chrono::Duration as ChronoDuration;
+    use jiff::Timestamp;
 
     use super::*;
     use crate::daemon::service::DaemonService;
@@ -628,7 +625,7 @@ mod tests {
         let (repo, _) = main_repo(root);
         let wt = root.join("wt");
         add_worktree(&repo, &wt, "feature");
-        let mut entry = closed_worktree_for(&wt, Utc::now()).unwrap();
+        let mut entry = closed_worktree_for(&wt, Timestamp::now()).unwrap();
         super::super::remove_worktree(&wt, &[]).unwrap();
         entry.removed = true;
         svc.registry.record_closed(vec![entry]);
@@ -641,7 +638,7 @@ mod tests {
         let (repo, main) = main_repo(&root);
         let wt = root.join("wt");
         add_worktree(&repo, &wt, "feature");
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let linked = closed_worktree_for(&wt, now).unwrap();
         assert_eq!(linked.path, wt);
@@ -668,15 +665,15 @@ mod tests {
         let wt = root.join("wt");
         add_worktree(&repo, &wt, "feature");
         std::fs::create_dir_all(wt.join("src/deep")).unwrap();
-        let entry = closed_worktree_for(&wt.join("src/deep"), Utc::now()).unwrap();
+        let entry = closed_worktree_for(&wt.join("src/deep"), Timestamp::now()).unwrap();
         assert_eq!(entry.path, wt);
     }
 
     #[test]
     fn closed_worktree_for_is_none_without_a_repository_or_a_folder() {
         let (_guard, root) = tempdir();
-        assert!(closed_worktree_for(&root, Utc::now()).is_none());
-        assert!(closed_worktree_for(&root.join("missing"), Utc::now()).is_none());
+        assert!(closed_worktree_for(&root, Timestamp::now()).is_none());
+        assert!(closed_worktree_for(&root.join("missing"), Timestamp::now()).is_none());
     }
 
     #[tokio::test]
@@ -791,7 +788,7 @@ mod tests {
         // An unmounted volume takes both away; neither was removed.
         let (_guard, root) = tempdir();
         let svc = WorktreesService::new();
-        let mut entry = closed_worktree_for(&main_repo(&root).1, Utc::now()).unwrap();
+        let mut entry = closed_worktree_for(&main_repo(&root).1, Timestamp::now()).unwrap();
         entry.path = root.join("gone").join("wt");
         entry.repo_root = root.join("gone").join("repo");
         svc.registry.record_closed(vec![entry]);
@@ -816,7 +813,7 @@ mod tests {
             .unwrap();
         repo.set_head("refs/heads/main").unwrap();
 
-        let entry = closed_worktree_for(&workdir, Utc::now()).unwrap();
+        let entry = closed_worktree_for(&workdir, Timestamp::now()).unwrap();
 
         assert_eq!(entry.repo_root, std::fs::canonicalize(&workdir).unwrap());
         assert!(entry.is_main);
@@ -954,7 +951,7 @@ mod tests {
         assert_eq!(reply["reopened"], true);
         assert_eq!(reply["recreated"], true);
         assert_eq!(reply["source"], "branch");
-        let recreated = closed_worktree_for(&wt, Utc::now()).unwrap();
+        let recreated = closed_worktree_for(&wt, Timestamp::now()).unwrap();
         assert_eq!(recreated.branch.as_deref(), Some("feature"));
         assert!(!recreated.is_main);
         assert_eq!(launched.paths(), std::slice::from_ref(&wt));
@@ -990,7 +987,7 @@ mod tests {
         let branch = repo.find_branch("feature", BranchType::Local).unwrap();
         assert_eq!(branch.get().target().unwrap(), head);
         assert_eq!(
-            closed_worktree_for(&wt, Utc::now())
+            closed_worktree_for(&wt, Timestamp::now())
                 .unwrap()
                 .branch
                 .as_deref(),
@@ -1010,7 +1007,7 @@ mod tests {
         // Record a commit the repository has never had.
         let mut entry = svc.registry.closed_entry(&wt).unwrap();
         entry.head_sha = Some("0123456789012345678901234567890123456789".to_string());
-        entry.closed_at += ChronoDuration::seconds(1);
+        entry.closed_at += jiff::SignedDuration::from_secs(1);
         svc.registry.record_closed(vec![entry]);
         let launched = Launched::default();
 
@@ -1055,7 +1052,7 @@ mod tests {
     fn a_main_working_tree_and_a_detached_head_are_never_recreated() {
         let (_guard, root) = tempdir();
         let (_repo, main) = main_repo(&root);
-        let mut entry = closed_worktree_for(&main, Utc::now()).unwrap();
+        let mut entry = closed_worktree_for(&main, Timestamp::now()).unwrap();
         entry.removed = true;
         let (plan, how) = plan_recreate(&entry);
         assert!(!plan.restorable && how.is_none());
@@ -1135,7 +1132,7 @@ mod tests {
         let svc = WorktreesService::new();
         svc.load_closed(file.clone());
         svc.registry
-            .record_closed(vec![closed_worktree_for(&wt, Utc::now()).unwrap()]);
+            .record_closed(vec![closed_worktree_for(&wt, Timestamp::now()).unwrap()]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1169,7 +1166,7 @@ mod tests {
         let wt = root.join("wt");
         add_worktree(&repo, &wt, "feature");
         svc.registry
-            .record_closed(vec![closed_worktree_for(&wt, Utc::now()).unwrap()]);
+            .record_closed(vec![closed_worktree_for(&wt, Timestamp::now()).unwrap()]);
         let fresh = WorktreesService::new();
         fresh.load_closed(corrupt);
         assert_eq!(fresh.registry.closed_entries().len(), 1);
@@ -1186,7 +1183,7 @@ mod tests {
         let (repo, main) = main_repo(&root);
         repo.remote("origin", "git@github.com:rust-works/omni-dev.git")
             .unwrap();
-        let github = closed_worktree_for(&main, Utc::now())
+        let github = closed_worktree_for(&main, Timestamp::now())
             .unwrap()
             .github
             .unwrap();
@@ -1329,7 +1326,7 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
         let mut entry = svc.registry.closed_entry(&wt).unwrap();
         entry.path = blocker.join("wt");
-        entry.closed_at += ChronoDuration::seconds(1);
+        entry.closed_at += jiff::SignedDuration::from_secs(1);
         svc.registry.record_closed(vec![entry.clone()]);
         let launched = Launched::default();
 
@@ -1406,7 +1403,7 @@ mod tests {
         svc.load_closed(blocker.join("closed.json"));
         let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
             svc.registry
-                .record_closed(vec![closed_worktree_for(&wt, Utc::now()).unwrap()]);
+                .record_closed(vec![closed_worktree_for(&wt, Timestamp::now()).unwrap()]);
         });
         assert!(
             logs.contains("could not persist recently-closed worktrees"),

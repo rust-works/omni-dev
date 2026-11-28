@@ -1,8 +1,8 @@
 //! CLI command for `omni-dev datadog logs search`.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
+use jiff::Timestamp;
 
 use crate::cli::datadog::format::{output_as, OutputFormat};
 use crate::cli::datadog::logs::{render_log_table, LogRow};
@@ -101,9 +101,7 @@ fn resolve_time_range(from: &str, to: &str) -> Result<(String, String)> {
 /// production inputs, so the fallback only fires for direct callers
 /// that pass extreme values (e.g. `i64::MAX`).
 fn epoch_to_rfc3339(seconds: i64) -> String {
-    DateTime::<Utc>::from_timestamp(seconds, 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+    crate::utils::time::rfc3339_secs(Timestamp::from_second(seconds).unwrap_or_default())
 }
 
 /// Fetches the search response and emits it in the requested format.
