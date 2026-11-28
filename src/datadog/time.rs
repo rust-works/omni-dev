@@ -35,7 +35,8 @@ pub fn parse_instant(spec: &str, now: Timestamp) -> Result<i64, DatadogError> {
     }
 
     if let Ok(secs) = spec.parse::<i64>() {
-        if secs >= 0 {
+        // Beyond year 9999 is not a time any renderer here can show (#2257).
+        if secs >= 0 && Timestamp::from_second(secs).is_ok() {
             return Ok(secs);
         }
     }
@@ -186,6 +187,15 @@ mod tests {
     #[test]
     fn rejects_unknown_unit() {
         assert!(parse_instant("5y", now()).is_err());
+    }
+
+    #[test]
+    fn rejects_an_epoch_past_year_9999() {
+        // The last second a timestamp holds is 9999-12-30T22:00:00Z.
+        let last = Timestamp::MAX.as_second();
+        assert_eq!(parse_instant(&last.to_string(), now()).unwrap(), last);
+        assert!(parse_instant(&(last + 1).to_string(), now()).is_err());
+        assert!(parse_instant("300000000000", now()).is_err());
     }
 
     #[test]

@@ -300,8 +300,8 @@ mod tests {
 
     #[test]
     fn format_timestamp_out_of_range_falls_back_to_now() {
-        // chrono rejects timestamps beyond i64 seconds; the `unwrap_or_else`
-        // fallback clamps to `Utc::now`. We only assert that it returns a
+        // A timestamp holds only the years -9999..=9999; the `unwrap_or_else`
+        // fallback clamps to `Timestamp::now`. We only assert that it returns a
         // plausibly-formatted RFC 3339 string rather than panicking.
         let s = format_timestamp(f64::MAX);
         assert!(s.ends_with('Z'));

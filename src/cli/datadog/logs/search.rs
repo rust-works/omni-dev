@@ -96,10 +96,10 @@ fn resolve_time_range(from: &str, to: &str) -> Result<(String, String)> {
 
 /// Renders an epoch-seconds timestamp as `YYYY-MM-DDTHH:MM:SSZ`.
 ///
-/// Falls back to the Unix epoch when `seconds` is outside the
-/// chrono-representable range. `parse_time_range` already validates
-/// production inputs, so the fallback only fires for direct callers
-/// that pass extreme values (e.g. `i64::MAX`).
+/// Falls back to the Unix epoch when `seconds` is outside the years
+/// -9999..=9999 a `jiff::Timestamp` holds. `parse_time_range` rejects such
+/// inputs, so the fallback only fires for direct callers that pass extreme
+/// values (e.g. `i64::MAX`).
 fn epoch_to_rfc3339(seconds: i64) -> String {
     crate::utils::time::rfc3339_secs(Timestamp::from_second(seconds).unwrap_or_default())
 }
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn epoch_to_rfc3339_falls_back_to_unix_epoch_on_out_of_range() {
-        // chrono can't represent i64::MAX seconds (year ~292 billion);
+        // A timestamp can't hold i64::MAX seconds (year ~292 billion);
         // the fallback produces 1970-01-01T00:00:00Z so the function
         // never panics on extreme inputs.
         assert_eq!(epoch_to_rfc3339(i64::MAX), "1970-01-01T00:00:00Z");
