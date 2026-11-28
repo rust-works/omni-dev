@@ -167,7 +167,10 @@ pub mod serde_rfc3339 {
 /// Written as RFC 3339 in that offset with [`rfc3339`]'s fraction rule, and a
 /// zero offset written as `Z`: `2024-01-01T10:00:00+10:00`,
 /// `2024-01-01T00:00:00Z`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Compared, ordered and hashed by the instant alone, as chrono's
+/// `DateTime<FixedOffset>` was: `10:00+10:00` equals `00:00Z`.
+#[derive(Debug, Clone, Copy)]
 pub struct OffsetTimestamp {
     timestamp: Timestamp,
     offset: Offset,
@@ -190,6 +193,32 @@ impl OffsetTimestamp {
     #[must_use]
     pub const fn offset(self) -> Offset {
         self.offset
+    }
+}
+
+impl PartialEq for OffsetTimestamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+    }
+}
+
+impl Eq for OffsetTimestamp {}
+
+impl PartialOrd for OffsetTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OffsetTimestamp {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+impl std::hash::Hash for OffsetTimestamp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.timestamp.hash(state);
     }
 }
 
@@ -352,6 +381,18 @@ mod tests {
         assert_eq!(parsed.offset(), Offset::from_hours(10).unwrap());
         assert_eq!(parsed.timestamp(), ts("2024-01-01T00:00:00Z"));
         assert!("2024-01-01T10:00:00".parse::<OffsetTimestamp>().is_err());
+    }
+
+    #[test]
+    fn offset_timestamps_compare_by_instant() {
+        let east: OffsetTimestamp = "2024-01-01T10:00:00+10:00".parse().unwrap();
+        let utc: OffsetTimestamp = "2024-01-01T00:00:00Z".parse().unwrap();
+        let later: OffsetTimestamp = "2024-01-01T00:00:01-05:00".parse().unwrap();
+        assert_eq!(east, utc);
+        assert_ne!(east.offset(), utc.offset());
+        assert!(utc < later && east < later);
+        let set: std::collections::HashSet<_> = [east, utc].into_iter().collect();
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
