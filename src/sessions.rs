@@ -1991,6 +1991,26 @@ mod tests {
     }
 
     #[test]
+    fn started_at_and_last_seen_keep_their_serialized_form() {
+        // `list`/`subscribe` replies carry these to the extension and the
+        // terminal UI, which parse them (#2257).
+        let registry = SessionsRegistry::new();
+        registry.observe(observe_request("s1", SessionEvent::UserPromptSubmit, None));
+        let base = registry.list().remove(0);
+        for field in ["started_at", "last_seen"] {
+            crate::test_support::timestamp_forms::assert_serializes(
+                |s| {
+                    let mut entry = base.clone();
+                    entry.started_at = crate::test_support::timestamp_forms::parse(s);
+                    entry.last_seen = crate::test_support::timestamp_forms::parse(s);
+                    entry
+                },
+                &format!("/{field}"),
+            );
+        }
+    }
+
+    #[test]
     fn list_is_empty_initially() {
         let reg = SessionsRegistry::new();
         assert!(reg.list().is_empty());

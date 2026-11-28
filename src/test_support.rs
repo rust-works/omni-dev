@@ -707,6 +707,155 @@ pub(crate) mod shallow_repo {
     }
 }
 
+pub(crate) mod timestamp_forms {
+    //! Pins how a timestamp field serializes, independently of the date-time
+    //! library behind it (#2257).
+    //!
+    //! Every helper takes the timestamp as a string and leaves the field's type to
+    //! inference ([`parse`]), so a test written against one library runs unchanged
+    //! against another. What a test pins is the string on the wire or on disk.
+    use std::fmt::Debug;
+    use std::str::FromStr;
+
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+    use serde_json::Value;
+
+    /// `(input, serialized)` pairs for a UTC timestamp field: the fraction is
+    /// written with 0, 3, 6 or 9 digits, whichever is the fewest that hold it,
+    /// and a non-UTC input is normalized to `Z`.
+    pub(crate) const UTC: &[(&str, &str)] = &[
+        ("2026-10-07T12:00:00Z", "2026-10-07T12:00:00Z"),
+        ("2026-10-07T12:00:00.5Z", "2026-10-07T12:00:00.500Z"),
+        ("2026-10-07T12:00:00.123Z", "2026-10-07T12:00:00.123Z"),
+        ("2026-10-07T12:00:00.12345Z", "2026-10-07T12:00:00.123450Z"),
+        ("2026-10-07T12:00:00.123456Z", "2026-10-07T12:00:00.123456Z"),
+        (
+            "2026-10-07T12:00:00.1234567Z",
+            "2026-10-07T12:00:00.123456700Z",
+        ),
+        (
+            "2026-10-07T12:00:00.123456789Z",
+            "2026-10-07T12:00:00.123456789Z",
+        ),
+        ("2026-10-07T22:30:00+10:30", "2026-10-07T12:00:00Z"),
+        ("2026-10-07T07:00:00.25-05:00", "2026-10-07T12:00:00.250Z"),
+    ];
+
+    /// `(input, serialized)` pairs for a field that keeps its UTC offset (a
+    /// commit's author date): the same fraction rule as [`UTC`], with the offset
+    /// written as `±HH:MM`, except that a zero offset is `Z`.
+    pub(crate) const OFFSET: &[(&str, &str)] = &[
+        ("2024-01-01T10:00:00+10:00", "2024-01-01T10:00:00+10:00"),
+        ("2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"),
+        ("2024-01-01T00:00:00+00:00", "2024-01-01T00:00:00Z"),
+        (
+            "2024-01-01T00:00:00.5-05:30",
+            "2024-01-01T00:00:00.500-05:30",
+        ),
+        (
+            "2024-06-30T23:59:59.1234567+05:45",
+            "2024-06-30T23:59:59.123456700+05:45",
+        ),
+        ("2024-12-31T19:00:00-09:00", "2024-12-31T19:00:00-09:00"),
+    ];
+
+    /// Parses `s` into whatever timestamp type the caller's field has.
+    pub(crate) fn parse<T>(s: &str) -> T
+    where
+        T: FromStr,
+        T::Err: Debug,
+    {
+        s.parse().unwrap_or_else(|e| panic!("parse {s:?}: {e:?}"))
+    }
+
+    /// [`parse`] into the type of `like`, where inference cannot tell.
+    pub(crate) fn parse_like<T>(_like: &T, s: &str) -> T
+    where
+        T: FromStr,
+        T::Err: Debug,
+    {
+        parse(s)
+    }
+
+    /// For each of [`UTC`], builds a value with `build(input)` and asserts the
+    /// string at JSON `pointer` in its serialization is the expected form.
+    pub(crate) fn assert_serializes<T: Serialize>(build: impl Fn(&str) -> T, pointer: &str) {
+        for (input, expected) in UTC {
+            let json = serde_json::to_value(build(input)).unwrap();
+            assert_eq!(
+                json.pointer(pointer).and_then(Value::as_str),
+                Some(*expected),
+                "{pointer} for input {input:?} in {json}"
+            );
+        }
+    }
+
+    /// For each of [`UTC`], writes the input at JSON `pointer` of `template`,
+    /// deserializes it into `T`, serializes it back and asserts the string at
+    /// `pointer` is the expected form: a round trip through a persisted file or
+    /// a wire reply.
+    pub(crate) fn assert_round_trips<T: Serialize + DeserializeOwned>(
+        template: &Value,
+        pointer: &str,
+    ) {
+        round_trip::<T>(UTC, template, pointer);
+    }
+
+    /// [`assert_round_trips`] for a field that keeps its UTC offset, over
+    /// [`OFFSET`].
+    pub(crate) fn assert_offset_round_trips<T: Serialize + DeserializeOwned>(
+        template: &Value,
+        pointer: &str,
+    ) {
+        round_trip::<T>(OFFSET, template, pointer);
+    }
+
+    fn round_trip<T: Serialize + DeserializeOwned>(
+        forms: &[(&str, &str)],
+        template: &Value,
+        pointer: &str,
+    ) {
+        for (input, expected) in forms {
+            let parsed: T = serde_json::from_value(with_string(template, pointer, input))
+                .unwrap_or_else(|e| panic!("deserialize {input:?} at {pointer}: {e}"));
+            let json = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                json.pointer(pointer).and_then(Value::as_str),
+                Some(*expected),
+                "{pointer} for input {input:?} in {json}"
+            );
+        }
+    }
+
+    /// For each of [`UTC`], writes the input at JSON `pointer` of `template`,
+    /// deserializes it into `T` and asserts `get` reads back the same instant as
+    /// the expected form: for a type that is only ever read.
+    pub(crate) fn assert_deserializes<T, Ts>(
+        template: &Value,
+        pointer: &str,
+        get: impl Fn(&T) -> Ts,
+    ) where
+        T: DeserializeOwned,
+        Ts: FromStr + PartialEq + Debug,
+        Ts::Err: Debug,
+    {
+        for (input, expected) in UTC {
+            let parsed: T = serde_json::from_value(with_string(template, pointer, input))
+                .unwrap_or_else(|e| panic!("deserialize {input:?} at {pointer}: {e}"));
+            assert_eq!(get(&parsed), parse::<Ts>(expected), "input {input:?}");
+        }
+    }
+
+    fn with_string(template: &Value, pointer: &str, s: &str) -> Value {
+        let mut value = template.clone();
+        *value
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("{pointer} is not in the template")) = Value::from(s);
+        value
+    }
+}
+
 #[cfg(test)]
 mod capture_writer_tests {
     use super::*;

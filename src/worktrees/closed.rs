@@ -228,6 +228,17 @@ mod tests {
         now() - ChronoDuration::minutes(n)
     }
 
+    #[test]
+    fn closed_at_keeps_its_serialized_form() {
+        // `worktrees-closed.json` outlives the binary that wrote it, and the same
+        // value rides the tree snapshot to the extension (#2257).
+        let template = serde_json::to_value(entry("/w", now())).unwrap();
+        crate::test_support::timestamp_forms::assert_round_trips::<ClosedWorktree>(
+            &template,
+            "/closed_at",
+        );
+    }
+
     fn paths(log: &ClosedLog) -> Vec<&str> {
         log.entries()
             .iter()

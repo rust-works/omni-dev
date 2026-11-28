@@ -400,6 +400,18 @@ mod tests {
         assert_eq!(summary["api_total"], 2);
         assert_eq!(summary["by_subcommand"]["pr view"], 1);
         assert_eq!(summary["since"], svc.started_at.to_rfc3339());
+        // The form is the reply's contract: `+00:00`, never `Z`, with 0, 3, 6 or
+        // 9 fraction digits (#2257).
+        let since = summary["since"].as_str().unwrap();
+        let form = regex::Regex::new(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.(\d{3}|\d{6}|\d{9}))?\+00:00$",
+        )
+        .unwrap();
+        assert!(form.is_match(since), "{since}");
+        assert_eq!(
+            crate::test_support::timestamp_forms::parse_like(&svc.started_at, since),
+            svc.started_at
+        );
     }
 
     #[tokio::test]

@@ -369,6 +369,52 @@ mod tests {
     }
 
     #[test]
+    fn fractional_seconds_keep_their_decoded_form() {
+        // The fraction is written with 0, 3, 6 or 9 digits, whichever is the
+        // fewest that hold it, and a pre-epoch value floors (#2257).
+        let cases = [
+            ("timestamp_ntz", "1704067200.5", "2024-01-01T00:00:00.500"),
+            (
+                "timestamp_ntz",
+                "1704067200.12345",
+                "2024-01-01T00:00:00.123450",
+            ),
+            (
+                "timestamp_ntz",
+                "1704067200.123456789",
+                "2024-01-01T00:00:00.123456789",
+            ),
+            ("timestamp_ntz", "-0.5", "1969-12-31T23:59:59.500"),
+            (
+                "timestamp_ltz",
+                "1704067200.250",
+                "2024-01-01T00:00:00.250+00:00",
+            ),
+            (
+                "timestamp_ltz",
+                "1704067200.1234567",
+                "2024-01-01T00:00:00.123456700+00:00",
+            ),
+            (
+                "timestamp_tz",
+                "1704067200.000001 1440",
+                "2024-01-01T00:00:00.000001+00:00",
+            ),
+            ("time", "3661.5", "01:01:01.500"),
+            ("time", "3661.12345", "01:01:01.123450"),
+            ("time", "0", "00:00:00"),
+            ("date", "-1", "1969-12-31"),
+        ];
+        for (ty, raw, expected) in cases {
+            assert_eq!(
+                value_to_json(Some(raw), &col(ty, None, None, Some(9))),
+                json!(expected),
+                "{ty} {raw}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_value_falls_back_to_raw() {
         assert_eq!(
             value_to_json(Some("maybe"), &col("boolean", None, None, None)),

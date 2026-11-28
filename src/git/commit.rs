@@ -1913,6 +1913,57 @@ mod tests {
     }
 
     #[test]
+    fn commit_date_keeps_its_serialized_form() {
+        // `date` is in every commit view's YAML, which AI prompts and users read
+        // (#2257).
+        let info = CommitInfo {
+            hash: "a".repeat(40),
+            author: "Test <test@example.com>".to_string(),
+            date: crate::test_support::timestamp_forms::parse("2024-01-01T00:00:00+00:00"),
+            original_message: "feat(cli): add flag".to_string(),
+            in_main_branches: Vec::new(),
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: "cli".to_string(),
+                proposed_message: "feat(cli): add flag".to_string(),
+                file_changes: make_file_changes(&[]),
+                diff_summary: String::new(),
+                diff_file: String::new(),
+                file_diffs: Vec::new(),
+            },
+        };
+        let template = serde_json::to_value(&info).unwrap();
+        crate::test_support::timestamp_forms::assert_offset_round_trips::<CommitInfo>(
+            &template, "/date",
+        );
+    }
+
+    #[test]
+    fn commit_date_is_the_author_time_in_the_author_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        for (secs, offset_minutes, expected) in [
+            (1_700_000_000, 600, "2023-11-15T08:13:20+10:00"),
+            (1_700_000_000, -330, "2023-11-14T16:43:20-05:30"),
+            (1_700_000_000, 0, "2023-11-14T22:13:20Z"),
+        ] {
+            let sig = git2::Signature::new(
+                "t",
+                "t@example.invalid",
+                &git2::Time::new(secs, offset_minutes),
+            )
+            .unwrap();
+            let id = repo.commit(None, &sig, &sig, "m", &tree, &[]).unwrap();
+            let commit = repo.find_commit(id).unwrap();
+            let info = CommitInfo::from_git_commit(&repo, &commit, &[]).unwrap();
+            assert_eq!(serde_json::to_value(&info).unwrap()["date"], expected);
+        }
+    }
+
+    #[test]
     fn from_commit_info_wraps_and_loads_diff() {
         let dir = tempfile::tempdir().unwrap();
         let diff_path = dir.path().join("test.diff");
