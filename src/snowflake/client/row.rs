@@ -196,7 +196,9 @@ fn number_or_string(s: &str) -> Value {
         .map_or_else(|| Value::String(s.to_string()), Value::Number)
 }
 
-/// `DATE` is days since the Unix epoch.
+/// `DATE` is days since the Unix epoch. A date outside the years -9999..=9999
+/// a `jiff` date holds (Snowflake documents 1582 to 9999 as its supported
+/// range) is returned as the raw day count, like any undecodable cell.
 fn decode_date(s: &str) -> Value {
     let Ok(days) = s.parse::<i64>() else {
         return Value::String(s.to_string());
@@ -247,7 +249,8 @@ fn decode_timestamp_tz(s: &str) -> Value {
     )
 }
 
-/// Parses an `seconds[.fraction]` epoch value into a UTC instant.
+/// Parses an `seconds[.fraction]` epoch value into a UTC instant, or `None`
+/// outside the years -9999..=9999 (see [`decode_date`]).
 fn decode_epoch(s: &str) -> Option<Timestamp> {
     let (secs, nanos) = split_seconds(s)?;
     Timestamp::new(secs, i32::try_from(nanos).ok()?).ok()
@@ -434,6 +437,25 @@ mod tests {
                 "{ty} {raw}"
             );
         }
+    }
+
+    #[test]
+    fn a_value_past_year_9999_falls_back_to_raw() {
+        for (ty, raw) in [
+            ("date", "3000000"),
+            ("timestamp_ntz", "300000000000"),
+            ("timestamp_ltz", "300000000000.5"),
+        ] {
+            assert_eq!(
+                value_to_json(Some(raw), &col(ty, None, None, Some(9))),
+                json!(raw),
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            value_to_json(Some("2932896"), &col("date", None, None, None)),
+            json!("9999-12-31")
+        );
     }
 
     #[test]
