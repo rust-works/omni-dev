@@ -412,11 +412,17 @@ mod tests {
     /// `Serialize` or `Deserialize`, whose attributes neither route it through
     /// [`serde_rfc3339`] nor skip it.
     fn unpinned_timestamp_fields(source: &str) -> Vec<(usize, String)> {
-        let field = regex::Regex::new(
-            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:\s*(?:Option\s*<\s*)?(?:jiff::)?Timestamp\b",
+        // A named field whose type mentions `Timestamp` (`Option<Timestamp>`,
+        // `Vec<Timestamp>`, ...), or a tuple field or variant holding one.
+        let named =
+            regex::Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:\s*[^=]*\bTimestamp\b").unwrap();
+        let tuple = regex::Regex::new(
+            r"^(?:pub(?:\([^)]*\))?\s+)?(?:struct\s+)?(\w+)\s*(?:<[^>]*>)?\s*\([^=]*\bTimestamp\b",
         )
         .unwrap();
         let mut found = Vec::new();
+        // The `#[derive(...)]` being read, which rustfmt may wrap.
+        let mut derive: Option<String> = None;
         let mut serde_derive_pending = false;
         // Brace depth inside the current serde type, when in one.
         let mut serde_depth: Option<i32> = None;
@@ -432,15 +438,23 @@ mod tests {
                     // rustfmt wraps a long attribute over several lines.
                     attributes.push_str(line);
                     in_attribute = !line.ends_with(']');
-                } else if let Some(name) = field.captures(line).map(|c| c[1].to_string()) {
-                    let pinned = attributes.contains("serde_rfc3339")
-                        || attributes.contains("serde(skip)")
-                        || attributes.contains("serde(skip,");
-                    if *depth == 1 && !pinned {
+                    continue;
+                }
+                let name = named
+                    .captures(line)
+                    .or_else(|| tuple.captures(line))
+                    .map(|c| c[1].to_string());
+                if let Some(name) = name {
+                    let pinned = [attributes.as_str(), line].iter().any(|text| {
+                        text.contains("serde_rfc3339")
+                            || text.contains("serde(skip)")
+                            || text.contains("serde(skip,")
+                    });
+                    if !pinned {
                         found.push((index + 1, name));
                     }
-                    attributes.clear();
-                } else if !line.is_empty() {
+                }
+                if !line.is_empty() {
                     attributes.clear();
                 }
                 *depth += brace_delta(line);
@@ -449,20 +463,42 @@ mod tests {
                 }
                 continue;
             }
-            if line.starts_with("#[derive(")
-                && (line.contains("Serialize") || line.contains("Deserialize"))
-            {
-                serde_derive_pending = true;
-            } else if serde_derive_pending && !line.starts_with("#[") && !line.is_empty() {
-                serde_derive_pending = false;
-                let is_type = line.contains("struct ") || line.contains("enum ");
-                if is_type && line.contains('{') {
-                    let depth = brace_delta(line);
-                    if depth > 0 {
-                        serde_depth = Some(depth);
-                        attributes.clear();
-                    }
+            if let Some(text) = derive.as_mut() {
+                text.push_str(line);
+            } else if line.starts_with("#[derive(") {
+                derive = Some(line.to_string());
+            }
+            if let Some(text) = derive.take_if(|text| text.ends_with(']')) {
+                serde_derive_pending |= text.contains("Serialize") || text.contains("Deserialize");
+                continue;
+            }
+            if derive.is_some() || !serde_derive_pending || line.is_empty() {
+                continue;
+            }
+            if line.starts_with("#[") {
+                in_attribute = !line.ends_with(']');
+                continue;
+            }
+            if in_attribute {
+                in_attribute = !line.ends_with(']');
+                continue;
+            }
+            // The item's header, which may run over several lines (generics, a
+            // `where` clause) before its body opens.
+            if let Some(name) = tuple.captures(line).map(|c| c[1].to_string()) {
+                if !line.contains("serde_rfc3339") {
+                    found.push((index + 1, name));
                 }
+            }
+            if line.contains('{') {
+                serde_derive_pending = false;
+                let depth = brace_delta(line);
+                if depth > 0 {
+                    serde_depth = Some(depth);
+                    attributes.clear();
+                }
+            } else if line.ends_with(';') {
+                serde_derive_pending = false;
             }
         }
         found
@@ -509,15 +545,37 @@ struct NotSerde {
 #[derive(Serialize)]
 enum Variants {
     One {
-        at: jiff::Timestamp,
+        variant_field: jiff::Timestamp,
     },
+    Two(Timestamp),
+    Three(#[serde(with = "crate::utils::time::serde_rfc3339")] Timestamp),
 }
+
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+struct Wrapped<T>
+where
+    T: Clone,
+{
+    many: Vec<Timestamp>,
+    other: T,
+}
+
+#[derive(Deserialize)]
+struct Tuple(Timestamp);
 "#;
         let names: Vec<String> = unpinned_timestamp_fields(source)
             .into_iter()
             .map(|(_, name)| name)
             .collect();
-        assert_eq!(names, vec!["at", "maybe"]);
+        assert_eq!(
+            names,
+            vec!["at", "maybe", "variant_field", "Two", "many", "Tuple"]
+        );
     }
 
     #[test]
