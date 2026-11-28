@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio::sync::mpsc;
 
 use super::client::WorktreesClient;
@@ -99,7 +99,7 @@ pub struct SessionSummary {
     pub id: String,
     pub model: Option<String>,
     pub state: SessionState,
-    pub last_seen: DateTime<Utc>,
+    pub last_seen: Timestamp,
 }
 
 impl From<&SessionBadge> for SessionSummary {
@@ -1657,7 +1657,7 @@ mod tests {
             id: id.to_string(),
             model: None,
             state: SessionState::Idle,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         }
     }
 

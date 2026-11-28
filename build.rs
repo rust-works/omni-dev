@@ -54,7 +54,7 @@ fn main() {
 
     // Build timestamp: honour SOURCE_DATE_EPOCH for reproducible builds, else the
     // wall clock. Stored as integer seconds since the epoch; RFC3339 formatting
-    // happens in Rust (via chrono, a runtime dependency) so this script needs no
+    // happens in Rust (via jiff, a runtime dependency) so this script needs no
     // date-formatting crate and stays portable across platforms.
     let epoch = env::var("SOURCE_DATE_EPOCH")
         .ok()

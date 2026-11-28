@@ -1646,7 +1646,7 @@ mod run_create_pr_tests {
         let commit = CommitInfo {
             hash: hash.to_string(),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: message.to_string(),
             in_main_branches: vec![],
             analysis: CommitAnalysis {
@@ -1894,7 +1894,7 @@ mod run_create_pr_tests {
         let commit = CommitInfo {
             hash: format!("{:0>40}", 0),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: "feat: UNIQUE_COMMIT_SUBJECT_MARKER".to_string(),
             in_main_branches: vec![],
             analysis: CommitAnalysis {

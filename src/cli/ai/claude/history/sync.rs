@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use super::common::{
@@ -89,7 +89,7 @@ impl SyncCommand {
             since: self.since.as_deref(),
             prune: self.prune,
             dry_run: self.dry_run,
-            now: Utc::now(),
+            now: Timestamp::now(),
             output_formats: formats,
             exclude_system: self.exclude_system,
         })?;
@@ -121,7 +121,7 @@ pub struct SyncOptions<'a> {
     pub since: Option<&'a str>,
     pub prune: bool,
     pub dry_run: bool,
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
     /// Set of file shapes to emit. Iteration order is canonical (jsonl first,
     /// then markdown) because [`FileFormat`] is `Ord`.
     pub output_formats: BTreeSet<FileFormat>,
@@ -259,8 +259,9 @@ pub fn run(opts: SyncOptions<'_>) -> Result<SyncReport> {
             let target_dir = opts.target.join(&slug);
 
             if let Some(cutoff) = cutoff {
-                let mtime: DateTime<Utc> = session.mtime.into();
-                if mtime < cutoff {
+                // An mtime outside the representable range is never skipped.
+                let mtime = Timestamp::try_from(session.mtime).ok();
+                if mtime.is_some_and(|mtime| mtime < cutoff) {
                     for &format in &opts.output_formats {
                         report.actions.push(SyncAction::Skipped {
                             project: slug.clone(),
@@ -712,7 +713,7 @@ mod tests {
             since: None,
             prune: false,
             dry_run: false,
-            now: chrono::Utc::now(),
+            now: jiff::Timestamp::now(),
             output_formats: formats,
             exclude_system: false,
         }

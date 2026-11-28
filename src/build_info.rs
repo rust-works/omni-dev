@@ -47,7 +47,9 @@ pub fn git_dirty() -> Option<bool> {
 #[must_use]
 pub fn build_timestamp() -> Option<String> {
     let secs: i64 = BUILD_EPOCH?.parse().ok()?;
-    chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.to_rfc3339())
+    jiff::Timestamp::from_second(secs)
+        .ok()
+        .map(crate::utils::time::rfc3339_offset)
 }
 
 /// Git provenance of the running binary, surfaced on the daemon `status`/`ping`
@@ -159,8 +161,11 @@ mod tests {
     fn build_timestamp_formats_epoch_seconds() {
         // `build_timestamp` reads a const, so validate the formatting on a fixed
         // epoch directly: 1_700_000_000 == 2023-11-14T22:13:20Z.
-        let dt = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        assert_eq!(dt.to_rfc3339(), "2023-11-14T22:13:20+00:00");
+        let ts = jiff::Timestamp::from_second(1_700_000_000).unwrap();
+        assert_eq!(
+            crate::utils::time::rfc3339_offset(ts),
+            "2023-11-14T22:13:20+00:00"
+        );
     }
 
     #[test]

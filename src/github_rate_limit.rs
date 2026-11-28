@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -236,8 +236,8 @@ fn trim_percent(percent: f64) -> String {
 /// unparseable epoch renders `??:??Z` rather than a misleading `00:00Z`.
 #[must_use]
 pub fn format_reset_utc(epoch: i64) -> String {
-    match DateTime::<Utc>::from_timestamp(epoch, 0) {
-        Some(dt) if epoch > 0 => dt.format("%H:%MZ").to_string(),
+    match Timestamp::from_second(epoch) {
+        Ok(ts) if epoch > 0 => ts.strftime("%H:%MZ").to_string(),
         _ => "??:??Z".to_string(),
     }
 }

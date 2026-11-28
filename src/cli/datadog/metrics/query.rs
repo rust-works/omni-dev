@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 use crate::cli::datadog::format::{output_as, OutputFormat};
 use crate::datadog::client::DatadogClient;
@@ -176,11 +176,11 @@ fn format_value(v: f64) -> String {
 fn format_timestamp(ms: f64) -> String {
     let secs = (ms / 1_000.0) as i64;
     let nsec = ((ms.rem_euclid(1_000.0)) * 1_000_000.0) as u32;
-    let dt: DateTime<Utc> = Utc
-        .timestamp_opt(secs, nsec)
-        .single()
-        .unwrap_or_else(Utc::now);
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    let ts = i32::try_from(nsec)
+        .ok()
+        .and_then(|nsec| Timestamp::new(secs, nsec).ok())
+        .unwrap_or_else(Timestamp::now);
+    crate::utils::time::rfc3339_secs(ts)
 }
 
 /// Writes a single table row with consistent 2-space gutter between columns.

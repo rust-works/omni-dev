@@ -5,7 +5,7 @@ use std::io::Read as _;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 use crate::utils::secret::Secret;
@@ -34,8 +34,8 @@ pub(crate) struct LoginTokens {
 struct Tokens {
     session_token: Secret,
     master_token: Secret,
-    session_expires_at: DateTime<Utc>,
-    master_expires_at: DateTime<Utc>,
+    session_expires_at: Timestamp,
+    master_expires_at: Timestamp,
 }
 
 /// The statement currently executing on a session, published for the duration of
@@ -152,14 +152,16 @@ impl SnowflakeSession {
         tokens: LoginTokens,
         query_timeout: Duration,
     ) -> Self {
-        let now = Utc::now();
+        let now = Timestamp::now();
         Self {
             transport,
             tokens: StdMutex::new(Tokens {
                 session_token: tokens.session_token,
                 master_token: tokens.master_token,
-                session_expires_at: now + TimeDelta::seconds(tokens.session_validity_secs),
-                master_expires_at: now + TimeDelta::seconds(tokens.master_validity_secs),
+                session_expires_at: now
+                    + jiff::SignedDuration::from_secs(tokens.session_validity_secs),
+                master_expires_at: now
+                    + jiff::SignedDuration::from_secs(tokens.master_validity_secs),
             }),
             in_flight: Arc::new(StdMutex::new(None)),
             query_timeout,
@@ -181,14 +183,16 @@ impl SnowflakeSession {
 
     /// Whether the session token expires within `within` from now.
     #[must_use]
-    pub fn session_expiring_within(&self, within: TimeDelta) -> bool {
-        Utc::now() + within >= self.lock().session_expires_at
+    pub fn session_expiring_within(&self, within: jiff::SignedDuration) -> bool {
+        Timestamp::now()
+            .checked_add(within)
+            .map_or(true, |deadline| deadline >= self.lock().session_expires_at)
     }
 
     /// When the master token currently expires (renewal must happen before this,
     /// kept alive by [`heartbeat`](Self::heartbeat)).
     #[must_use]
-    pub fn master_expires_at(&self) -> DateTime<Utc> {
+    pub fn master_expires_at(&self) -> Timestamp {
         self.lock().master_expires_at
     }
 
@@ -351,12 +355,13 @@ impl SnowflakeSession {
 
         let mut tokens = self.lock();
         tokens.session_token = new_session.into();
-        tokens.session_expires_at = Utc::now() + TimeDelta::seconds(st_validity);
+        tokens.session_expires_at = Timestamp::now() + jiff::SignedDuration::from_secs(st_validity);
         if let Some(master_token) = data.get("masterToken").and_then(Value::as_str) {
             tokens.master_token = master_token.into();
         }
         if let Some(mt_validity) = data.get("validityInSecondsMT").and_then(Value::as_i64) {
-            tokens.master_expires_at = Utc::now() + TimeDelta::seconds(mt_validity);
+            tokens.master_expires_at =
+                Timestamp::now() + jiff::SignedDuration::from_secs(mt_validity);
         }
         Ok(())
     }
@@ -712,9 +717,9 @@ mod tests {
             },
             Duration::from_secs(5),
         );
-        assert!(session.master_expires_at() > Utc::now());
-        assert!(!session.session_expiring_within(TimeDelta::seconds(60)));
-        assert!(session.session_expiring_within(TimeDelta::seconds(7200)));
+        assert!(session.master_expires_at() > Timestamp::now());
+        assert!(!session.session_expiring_within(jiff::SignedDuration::from_secs(60)));
+        assert!(session.session_expiring_within(jiff::SignedDuration::from_secs(7200)));
     }
 
     #[test]
@@ -722,8 +727,8 @@ mod tests {
         let tokens = Tokens {
             session_token: "sekret-session-token".into(),
             master_token: "sekret-master-token".into(),
-            session_expires_at: Utc::now(),
-            master_expires_at: Utc::now(),
+            session_expires_at: Timestamp::now(),
+            master_expires_at: Timestamp::now(),
         };
         // Debug must never print the token values (#1131).
         let debug = format!("{tokens:?}");
@@ -938,9 +943,9 @@ mod tests {
 
         // A nearly-expired session is no longer about to expire after a renew.
         let session = live_session(&server, 1);
-        assert!(session.session_expiring_within(TimeDelta::seconds(120)));
+        assert!(session.session_expiring_within(jiff::SignedDuration::from_secs(120)));
         session.renew().await.unwrap();
-        assert!(!session.session_expiring_within(TimeDelta::seconds(120)));
+        assert!(!session.session_expiring_within(jiff::SignedDuration::from_secs(120)));
     }
 
     #[tokio::test]

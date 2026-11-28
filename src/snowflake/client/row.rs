@@ -9,8 +9,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
+use jiff::civil::{Date, Time};
+use jiff::tz::Offset;
+use jiff::{Span, Timestamp};
 use serde_json::{json, Map, Value};
+
+use crate::utils::time::{auto_digits, printer, rfc3339_offset};
 
 /// Metadata for one result column, from the query response `rowtype`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,10 +168,15 @@ pub fn value_to_json(raw: Option<&str>, col: &Column) -> Value {
         "time" => decode_time(s),
         "timestamp_ntz" => decode_epoch(s).map_or_else(
             || Value::String(s.to_string()),
-            |dt| json!(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
+            |ts| {
+                let civil = Offset::UTC.to_datetime(ts);
+                json!(printer(auto_digits(civil.subsec_nanosecond())).datetime_to_string(&civil))
+            },
         ),
-        "timestamp_ltz" => decode_epoch(s)
-            .map_or_else(|| Value::String(s.to_string()), |dt| json!(dt.to_rfc3339())),
+        "timestamp_ltz" => decode_epoch(s).map_or_else(
+            || Value::String(s.to_string()),
+            |ts| json!(rfc3339_offset(ts)),
+        ),
         "timestamp_tz" => decode_timestamp_tz(s),
         "variant" | "object" | "array" => {
             serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
@@ -192,15 +201,12 @@ fn decode_date(s: &str) -> Value {
     let Ok(days) = s.parse::<i64>() else {
         return Value::String(s.to_string());
     };
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default();
-    let date = if days >= 0 {
-        epoch.checked_add_days(Days::new(days.unsigned_abs()))
-    } else {
-        epoch.checked_sub_days(Days::new(days.unsigned_abs()))
-    };
+    let date = Span::new()
+        .try_days(days)
+        .and_then(|span| jiff::civil::date(1970, 1, 1).checked_add(span));
     date.map_or_else(
-        || Value::String(s.to_string()),
-        |d| json!(d.format("%Y-%m-%d").to_string()),
+        |_| Value::String(s.to_string()),
+        |d: Date| json!(d.strftime("%Y-%m-%d").to_string()),
     )
 }
 
@@ -212,9 +218,22 @@ fn decode_time(s: &str) -> Value {
     if secs < 0 {
         return Value::String(s.to_string());
     }
-    NaiveTime::from_num_seconds_from_midnight_opt(secs.unsigned_abs() as u32, nanos).map_or_else(
+    let time = (secs < 24 * 60 * 60)
+        .then(|| {
+            // In range by the checks above: `secs` is below a day, `nanos` below
+            // a second.
+            #[allow(clippy::cast_possible_truncation)]
+            let (h, m, sec) = (
+                (secs / 3600) as i8,
+                (secs / 60 % 60) as i8,
+                (secs % 60) as i8,
+            );
+            Time::new(h, m, sec, i32::try_from(nanos).ok()?).ok()
+        })
+        .flatten();
+    time.map_or_else(
         || Value::String(s.to_string()),
-        |t| json!(t.format("%H:%M:%S%.f").to_string()),
+        |t| json!(printer(auto_digits(t.subsec_nanosecond())).time_to_string(&t)),
     )
 }
 
@@ -222,13 +241,16 @@ fn decode_time(s: &str) -> Value {
 /// the UTC instant (the offset is advisory and dropped here).
 fn decode_timestamp_tz(s: &str) -> Value {
     let epoch = s.split_whitespace().next().unwrap_or(s);
-    decode_epoch(epoch).map_or_else(|| Value::String(s.to_string()), |dt| json!(dt.to_rfc3339()))
+    decode_epoch(epoch).map_or_else(
+        || Value::String(s.to_string()),
+        |ts| json!(rfc3339_offset(ts)),
+    )
 }
 
 /// Parses an `seconds[.fraction]` epoch value into a UTC instant.
-fn decode_epoch(s: &str) -> Option<DateTime<Utc>> {
+fn decode_epoch(s: &str) -> Option<Timestamp> {
     let (secs, nanos) = split_seconds(s)?;
-    DateTime::from_timestamp(secs, nanos)
+    Timestamp::new(secs, i32::try_from(nanos).ok()?).ok()
 }
 
 /// Splits a signed `seconds[.fraction]` string into `(seconds, nanoseconds)`,

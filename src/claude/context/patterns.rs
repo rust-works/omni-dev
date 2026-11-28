@@ -375,7 +375,7 @@ mod tests {
         CommitInfo {
             hash: "a".repeat(40),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: message.to_string(),
             in_main_branches: Vec::new(),
             analysis: CommitAnalysis {

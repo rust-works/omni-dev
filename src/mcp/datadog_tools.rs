@@ -644,13 +644,7 @@ fn resolve_logs_time_range(from: &str, to: &str) -> Result<(String, String)> {
 }
 
 fn epoch_to_rfc3339(secs: i64) -> String {
-    use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
-    let dt: DateTime<Utc> = Utc.timestamp_opt(secs, 0).single().unwrap_or_else(|| {
-        Utc.timestamp_opt(0, 0)
-            .single()
-            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default())
-    });
-    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+    crate::utils::time::rfc3339_secs(jiff::Timestamp::from_second(secs).unwrap_or_default())
 }
 
 /// Parses an MCP-supplied sort order string.

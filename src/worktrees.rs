@@ -26,7 +26,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -80,7 +80,7 @@ pub struct Departure {
     pub folders: Vec<PathBuf>,
     /// When it left: the unregister time, or — for a window that aged out — the
     /// last time it was heard from.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 /// A `register` request from a companion extension.
@@ -125,7 +125,8 @@ pub struct WindowEntry {
     pub pid: Option<u32>,
     /// When the registry last heard from this window (register or heartbeat), by
     /// the wall clock. For display only: liveness is measured on `last_active`.
-    pub last_seen: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub last_seen: Timestamp,
     /// The registry's [`AwakeClock`] reading when this window was last heard
     /// from. [`reap_departed`] and [`evict_oldest`] compare it, so a system sleep ages no
     /// window (#2126). Never serialized: a reading means nothing outside the
@@ -263,7 +264,7 @@ pub struct WorktreesRegistry {
     /// drop, and the poller stops within one snapshot tick of expiry.
     ///
     /// [`poll_ttl`]: Self::poll_ttl
-    polling_enabled: Mutex<HashMap<String, DateTime<Utc>>>,
+    polling_enabled: Mutex<HashMap<String, Timestamp>>,
     /// How long a repo's PR-poll lease lasts before it auto-expires (#1376).
     /// [`DEFAULT_POLL_LEASE`] in production; tests inject a short value via the
     /// `#[cfg(test)]` `with_poll_ttl` constructor (not linked — it does not exist
@@ -375,7 +376,7 @@ impl WorktreesRegistry {
     /// evicts the longest-silent entry. Infallible: an upsert never evicts, and
     /// callers validate the `key` before reaching here.
     pub fn register(&self, req: RegisterRequest) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let awake = self.clock.now();
         // A worktree that is open again is not "closed" (#2211): this is what keeps
         // a window reload (unregister, then register) and a worktree the user
@@ -429,8 +430,8 @@ impl WorktreesRegistry {
     /// two compose: the credit shifts a stamp by time the daemon was awake but
     /// deaf, and a system sleep still ages nothing (#2126).
     pub fn credit_outage(&self, outage: Duration) {
-        let credit = ChronoDuration::from_std(outage).ok();
-        let now = Utc::now();
+        let credit = jiff::SignedDuration::try_from(outage).ok();
+        let now = Timestamp::now();
         let mut windows = self.lock();
         // Read under the lock, not before it: every stamp already in the map was
         // taken before its writer locked, so a reading taken now is at least as
@@ -443,7 +444,7 @@ impl WorktreesRegistry {
                 .checked_add(outage)
                 .map_or(awake, |credited| credited.min(awake));
             entry.last_seen = credit
-                .and_then(|credit| entry.last_seen.checked_add_signed(credit))
+                .and_then(|credit| entry.last_seen.checked_add(credit).ok())
                 .map_or(now, |credited| credited.min(now));
         }
     }
@@ -453,7 +454,7 @@ impl WorktreesRegistry {
     /// daemon restart — to re-`register`, since the registry is in-memory and
     /// has no record of it.
     pub fn heartbeat(&self, key: &str) -> bool {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let awake = self.clock.now();
         let (known, departed) = {
             let mut windows = self.lock();
@@ -494,7 +495,7 @@ impl WorktreesRegistry {
         let removed = removed.is_some_and(|entry| {
             departed.push(Departure {
                 folders: entry.folders,
-                at: Utc::now(),
+                at: Timestamp::now(),
             });
             true
         });
@@ -686,7 +687,7 @@ impl WorktreesRegistry {
     /// Locks the per-repo PR-poll lease map (`"owner/name"` → lease-expiry
     /// instant), recovering from a poisoned mutex (a panic in a prior critical
     /// section must not wedge polling for the whole daemon).
-    fn polling_lock(&self) -> MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
+    fn polling_lock(&self) -> MutexGuard<'_, HashMap<String, Timestamp>> {
         self.polling_enabled
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -698,7 +699,7 @@ impl WorktreesRegistry {
     /// explicitly enabled, within the last [`poll_ttl`](Self::poll_ttl), poll.
     #[must_use]
     pub fn is_polling_enabled(&self, owner: &str, name: &str) -> bool {
-        let now = Utc::now();
+        let now = Timestamp::now();
         self.polling_lock()
             .get(&polling_key(owner, name))
             .is_some_and(|expiry| *expiry > now)
@@ -712,7 +713,7 @@ impl WorktreesRegistry {
     /// build that reads it.
     #[must_use]
     pub fn enabled_polling_repos(&self) -> HashSet<String> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut map = self.polling_lock();
         map.retain(|_, expiry| *expiry > now);
         map.keys().cloned().collect()
@@ -724,11 +725,11 @@ impl WorktreesRegistry {
     /// time rather than resetting the clock. Reaps expired leases first, so a
     /// stale entry is never written back.
     #[must_use]
-    pub fn polling_snapshot(&self) -> Vec<(String, DateTime<Utc>)> {
-        let now = Utc::now();
+    pub fn polling_snapshot(&self) -> Vec<(String, Timestamp)> {
+        let now = Timestamp::now();
         let mut map = self.polling_lock();
         map.retain(|_, expiry| *expiry > now);
-        let mut entries: Vec<(String, DateTime<Utc>)> =
+        let mut entries: Vec<(String, Timestamp)> =
             map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
@@ -747,14 +748,14 @@ impl WorktreesRegistry {
     /// persists without waking anyone.
     pub fn set_polling(&self, owner: &str, name: &str, enabled: bool) -> bool {
         let key = polling_key(owner, name);
-        let now = Utc::now();
+        let now = Timestamp::now();
         let (changed, flipped) = {
             let mut map = self.polling_lock();
             let was_enabled = map.get(&key).is_some_and(|expiry| *expiry > now);
             if enabled {
                 let expiry = now
-                    + ChronoDuration::from_std(self.poll_ttl).unwrap_or_else(|_| {
-                        ChronoDuration::seconds(DEFAULT_POLL_LEASE.as_secs() as i64)
+                    + jiff::SignedDuration::try_from(self.poll_ttl).unwrap_or_else(|_| {
+                        jiff::SignedDuration::from_secs(DEFAULT_POLL_LEASE.as_secs() as i64)
                     });
                 let changed = map.insert(key, expiry) != Some(expiry);
                 (changed, !was_enabled)
@@ -774,8 +775,8 @@ impl WorktreesRegistry {
     /// Does **not** [`bump`](Self::bump): it runs before any window subscribes, so
     /// there is no one to notify, and each window's first snapshot already
     /// reflects the seeded leases.
-    pub fn seed_polling(&self, leases: impl IntoIterator<Item = (String, DateTime<Utc>)>) {
-        let now = Utc::now();
+    pub fn seed_polling(&self, leases: impl IntoIterator<Item = (String, Timestamp)>) {
+        let now = Timestamp::now();
         *self.polling_lock() = leases
             .into_iter()
             .filter(|(_, expiry)| *expiry > now)
@@ -792,7 +793,7 @@ impl WorktreesRegistry {
     /// Test-only: forces `owner/name`'s lease to `expiry`, so a test can simulate
     /// an elapsed lease deterministically without sleeping for [`poll_ttl`].
     #[cfg(test)]
-    pub fn set_polling_expiry(&self, owner: &str, name: &str, expiry: DateTime<Utc>) {
+    pub fn set_polling_expiry(&self, owner: &str, name: &str, expiry: Timestamp) {
         self.polling_lock().insert(polling_key(owner, name), expiry);
     }
 
@@ -902,7 +903,7 @@ impl WorktreesRegistry {
                 Vec::new()
             }
         };
-        *self.closed_lock() = ClosedLog::from_entries(entries, Utc::now());
+        *self.closed_lock() = ClosedLog::from_entries(entries, Timestamp::now());
         *self
             .closed_path
             .lock()
@@ -913,7 +914,7 @@ impl WorktreesRegistry {
     /// entry that has aged out is gone from the answer *and* the file.
     pub fn closed_entries(&self) -> Vec<ClosedWorktree> {
         let mut log = self.closed_lock();
-        if log.prune(Utc::now()) {
+        if log.prune(Timestamp::now()) {
             self.persist_closed(&log);
         }
         log.entries().to_vec()
@@ -931,7 +932,7 @@ impl WorktreesRegistry {
         if entries.is_empty() {
             return;
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         let changed = {
             let mut log = self.closed_lock();
             let mut changed = false;
@@ -1320,7 +1321,7 @@ mod tests {
         insert_silent(&reg, "w", Duration::from_secs(1));
         reg.credit_outage(Duration::from_secs(3600));
         assert!(reg.lock()["w"].last_active <= reg.clock.now());
-        assert!(reg.lock()["w"].last_seen <= Utc::now());
+        assert!(reg.lock()["w"].last_seen <= Timestamp::now());
         // Even a duration neither clock can add is saturated, not a panic and
         // not skipped: the awake stamp still moves up to now.
         insert_silent(&reg, "x", Duration::from_secs(20));
@@ -1329,7 +1330,7 @@ mod tests {
         assert!(
             reg.lock()["x"].last_active > reg.clock.now().saturating_sub(Duration::from_secs(1))
         );
-        assert!(reg.lock()["x"].last_seen <= Utc::now());
+        assert!(reg.lock()["x"].last_seen <= Timestamp::now());
     }
 
     #[test]
@@ -1337,13 +1338,14 @@ mod tests {
         let reg = registry_with_headroom();
         insert_silent(&reg, "w", Duration::from_secs(40));
         let active = reg.lock()["w"].last_active;
-        reg.lock().get_mut("w").unwrap().last_seen = Utc::now() - ChronoDuration::seconds(40);
+        reg.lock().get_mut("w").unwrap().last_seen =
+            Timestamp::now() - jiff::SignedDuration::from_secs(40);
 
         reg.credit_outage(Duration::from_secs(25));
 
         let guard = reg.lock();
         assert_eq!(guard["w"].last_active, active + Duration::from_secs(25));
-        let shown_age = (Utc::now() - guard["w"].last_seen).num_seconds();
+        let shown_age = (Timestamp::now() - guard["w"].last_seen).as_secs();
         assert!(
             (14..=16).contains(&shown_age),
             "40 s silent less the 25 s credit reads ~15 s, got {shown_age}"
@@ -1371,7 +1373,7 @@ mod tests {
             repo: None,
             title: None,
             pid: None,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
             last_active,
         }
     }
@@ -1562,7 +1564,7 @@ mod tests {
 
     /// Moves every wall-clock stamp back by `by`, as a laptop sleeping that long
     /// would, without any awake time passing.
-    fn jump_wall_clock_forward(reg: &WorktreesRegistry, by: ChronoDuration) {
+    fn jump_wall_clock_forward(reg: &WorktreesRegistry, by: jiff::SignedDuration) {
         for entry in reg.lock().values_mut() {
             entry.last_seen -= by;
         }
@@ -1578,7 +1580,7 @@ mod tests {
         reg.register(register_request("w2", Some("repo-b"), "/tmp/b"));
         reg.register(register_request("w3", None, "/tmp/c"));
 
-        jump_wall_clock_forward(&reg, ChronoDuration::days(3));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(24 * 3));
 
         // Every reading path, and the mutating one that reaps first.
         assert_eq!(reg.list().len(), 3, "list");
@@ -1590,7 +1592,9 @@ mod tests {
         assert!(reg.unregister("w3"));
         assert_eq!(reg.list().len(), 2, "unregister reaped nothing else");
         // Display still reads the wall clock: the stale `last_seen` is shown.
-        assert!(reg.list()[1].last_seen < Utc::now() - ChronoDuration::days(2));
+        assert!(
+            reg.list()[1].last_seen < Timestamp::now() - jiff::SignedDuration::from_hours(24 * 2)
+        );
     }
 
     #[test]
@@ -1599,7 +1603,7 @@ mod tests {
         let reg = WorktreesRegistry::new();
         reg.register(register_request("w1", None, "/tmp/a"));
         let rx = reg.subscribe_changes();
-        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(8));
         assert!(reg.heartbeat("w1"));
         assert!(!rx.has_changed().unwrap());
     }
@@ -1634,7 +1638,7 @@ mod tests {
         let reg = WorktreesRegistry::new();
         reg.register(register_request("w1", None, "/tmp/a"));
         reg.clock.advance(just_inside_the_ttl());
-        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(8));
         // A heartbeat after the wake-up refreshes the awake stamp as well.
         assert!(reg.heartbeat("w1"));
         reg.clock.advance(just_inside_the_ttl());
@@ -1660,13 +1664,13 @@ mod tests {
         let control = WorktreesRegistry::new();
         control.register(register_request("w", None, "/tmp/a"));
         control.clock.advance(Duration::from_secs(35));
-        jump_wall_clock_forward(&control, ChronoDuration::hours(8));
+        jump_wall_clock_forward(&control, jiff::SignedDuration::from_hours(8));
         assert!(control.list().is_empty(), "the control for the test");
 
         let reg = WorktreesRegistry::new();
         reg.register(register_request("w", None, "/tmp/a"));
         reg.clock.advance(Duration::from_secs(35));
-        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(8));
         reg.credit_outage(Duration::from_secs(15));
         assert_eq!(reg.list().len(), 1);
     }
@@ -1683,7 +1687,7 @@ mod tests {
         // awake stamp may decide who is the longest-silent.
         for entry in reg.lock().values_mut() {
             if entry.key != "quiet" {
-                entry.last_seen -= ChronoDuration::days(1);
+                entry.last_seen -= jiff::SignedDuration::from_hours(24);
             }
         }
         reg.register(register_request("fresh", None, "/tmp/f"));
@@ -1703,7 +1707,7 @@ mod tests {
         reg.mark_close_pending("w1");
         reg.mark_reload_pending("w1");
 
-        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        jump_wall_clock_forward(&reg, jiff::SignedDuration::from_hours(8));
 
         assert!(reg.heartbeat("w1"), "the window is known after the wake-up");
         assert!(reg.take_close_pending("w1"));
@@ -2024,7 +2028,7 @@ mod tests {
         reg.set_polling_expiry(
             "rust-works",
             "omni-dev",
-            Utc::now() - ChronoDuration::seconds(1),
+            Timestamp::now() - jiff::SignedDuration::from_secs(1),
         );
         assert!(
             !reg.is_polling_enabled("rust-works", "omni-dev"),
@@ -2080,8 +2084,8 @@ mod tests {
     fn seed_polling_loads_leases_and_drops_expired() {
         let reg = WorktreesRegistry::new();
         reg.set_polling("a", "z", true);
-        let future = Utc::now() + ChronoDuration::minutes(10);
-        let past = Utc::now() - ChronoDuration::minutes(1);
+        let future = Timestamp::now() + jiff::SignedDuration::from_mins(10);
+        let past = Timestamp::now() - jiff::SignedDuration::from_mins(1);
         // Seeding (the startup load) replaces wholesale, dropping the prior entry
         // and any already-expired lease from the file.
         reg.seed_polling([
@@ -2119,7 +2123,7 @@ mod tests {
             head_sha: None,
             is_main: false,
             removed: false,
-            closed_at: Utc::now() - ChronoDuration::minutes(minutes_ago),
+            closed_at: Timestamp::now() - jiff::SignedDuration::from_mins(minutes_ago),
         }
     }
 
@@ -2222,9 +2226,11 @@ mod tests {
         let fresh = closed_entry("/wt/fresh", 1);
         let stale = closed_entry("/wt/stale", 60 * 24 * (closed::MAX_AGE_DAYS + 1));
         // Inserted through the log directly: `record_closed` would prune it.
-        *reg.closed_lock() = ClosedLog::from_entries(vec![fresh.clone()], Utc::now());
-        reg.closed_lock()
-            .record(stale, Utc::now() - ChronoDuration::days(365));
+        *reg.closed_lock() = ClosedLog::from_entries(vec![fresh.clone()], Timestamp::now());
+        reg.closed_lock().record(
+            stale,
+            Timestamp::now() - jiff::SignedDuration::from_hours(24 * 365),
+        );
         let kept = reg.closed_entries();
         assert_eq!(kept, vec![fresh]);
     }

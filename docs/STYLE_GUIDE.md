@@ -189,8 +189,8 @@ Considering `unwrap()`, `expect()`, or other panicking calls.
       LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9-]*$").unwrap());
   ```
 
-- **Known-safe constructors** — `FixedOffset::east_opt(0).unwrap()` where the argument is
-  a constant that cannot fail.
+- **Known-safe constructors** — `jiff::tz::Offset::from_hours(10).unwrap()` where the
+  argument is a constant that cannot fail.
 - **Test code** — tests may use `unwrap()` freely.
 
 **`expect()` is acceptable** for truly catastrophic I/O that should terminate the process:
@@ -850,7 +850,7 @@ Literals that do **not** need extraction:
 
 - **Structural zeros and ones** — `Vec::with_capacity(1)`, `index + 1`, `slice[0]`.
 - **Format strings** — `format!("{}: {}", key, value)`.
-- **Known-safe constructor arguments** — `FixedOffset::east_opt(0)` (covered by STYLE-0003).
+- **Known-safe constructor arguments** — `Offset::from_hours(10)` (covered by STYLE-0003).
 - **Test assertions** — `assert_eq!(result.len(), 3)` where the value is local to the test.
 
 Place constants at the narrowest useful scope: module-level `const` if used across functions in

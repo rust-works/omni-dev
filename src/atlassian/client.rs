@@ -205,7 +205,7 @@ fn transition_from_entry(t: JiraTransitionEntry) -> JiraTransition {
 /// have to interpret JIRA's opaque 400s on malformed dates.
 fn validate_iso_date(date: Option<&str>, field: &str) -> Result<()> {
     let Some(d) = date else { return Ok(()) };
-    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+    jiff::civil::Date::strptime("%Y-%m-%d", d)
         .with_context(|| format!("{field} must be YYYY-MM-DD, got {d:?}"))?;
     Ok(())
 }

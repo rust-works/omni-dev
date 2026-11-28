@@ -11,7 +11,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
@@ -179,12 +179,12 @@ fn session_menu_items(sessions: &[SessionInfo]) -> Vec<MenuItem> {
         // doing: the running query + elapsed when busy, else idle time.
         for member in &session.members {
             let state = if let Some(running) = &member.running {
-                let secs = (Utc::now() - running.started_at).num_seconds().max(0);
+                let secs = (Timestamp::now() - running.started_at).as_secs().max(0);
                 format!("running {secs}s: {}", running.sql)
             } else if member.busy {
                 "busy".to_string()
             } else {
-                let idle = (Utc::now() - member.last_used).num_seconds().max(0);
+                let idle = (Timestamp::now() - member.last_used).as_secs().max(0);
                 format!("idle {idle}s · {} queries", member.query_count)
             };
             items.push(MenuItem::Label(format!(
@@ -337,7 +337,7 @@ mod tests {
     fn session_menu_items_render_each_member_state_and_actions() {
         use crate::snowflake::session::{MemberInfo, QueryContext, RunningQuery};
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let wh_ctx = QueryContext {
             warehouse: Some("WH".to_string()),
             role: Some("R".to_string()),

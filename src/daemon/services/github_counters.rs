@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -71,7 +71,7 @@ type SharedTally = Arc<Mutex<IncrementalCounts>>;
 pub struct GithubCountersService {
     /// When the daemon started, so every summary reports calls **since boot** —
     /// a clean before/after marker that resets across restarts.
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     /// Counts of the `gh` records logged since `started_at`; `None` when no log
     /// path resolves, so there is nothing to count.
     tally: Option<SharedTally>,
@@ -106,7 +106,7 @@ impl GithubCountersService {
                 let tally = IncrementalCounts::start(path);
                 (tally.since(), Some(Arc::new(Mutex::new(tally))))
             }
-            None => (Utc::now(), None),
+            None => (Timestamp::now(), None),
         };
         Self {
             started_at,
@@ -235,7 +235,10 @@ impl DaemonService for GithubCountersService {
                     counts_since_boot(&self.tally, cancelled_by(&self.stopping)).await;
                 let mut value = counts.to_json();
                 if let Value::Object(map) = &mut value {
-                    map.insert("since".to_string(), json!(self.started_at.to_rfc3339()));
+                    map.insert(
+                        "since".to_string(),
+                        json!(crate::utils::time::rfc3339_offset(self.started_at)),
+                    );
                     if !current {
                         map.insert("incomplete".to_string(), json!(true));
                     }
@@ -304,15 +307,15 @@ impl DaemonService for GithubCountersService {
 mod tests {
     use super::*;
     use crate::github_metrics::aggregate;
-    use chrono::{Duration as ChronoDuration, SecondsFormat};
+    use jiff::Timestamp;
     use std::io::Write;
     use std::path::Path;
 
     /// A `gh` record line stamped `secs` seconds after `since`.
-    fn gh_line(since: DateTime<Utc>, secs: i64, command: &[&str]) -> String {
+    fn gh_line(since: Timestamp, secs: i64, command: &[&str]) -> String {
         format!(
             "{{\"kind\":\"gh\",\"timestamp\":\"{}\",\"command\":{},\"source\":\"daemon\"}}\n",
-            (since + ChronoDuration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Millis, true),
+            crate::utils::time::rfc3339_millis(since + jiff::SignedDuration::from_secs(secs)),
             serde_json::to_string(command).unwrap(),
         )
     }
@@ -375,7 +378,7 @@ mod tests {
         // Records already in the log at boot, stamped *inside* the window (the
         // future): a full scan counts every one, so the service reporting none of
         // them means it never read them.
-        let future = Utc::now() + ChronoDuration::hours(1);
+        let future = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let pre: String = (0..50)
             .map(|_| gh_line(future, 0, &["pr", "list"]))
             .collect();
@@ -399,7 +402,10 @@ mod tests {
         let summary = svc.handle("summary", Value::Null).await.unwrap();
         assert_eq!(summary["api_total"], 2);
         assert_eq!(summary["by_subcommand"]["pr view"], 1);
-        assert_eq!(summary["since"], svc.started_at.to_rfc3339());
+        assert_eq!(
+            summary["since"],
+            crate::utils::time::rfc3339_offset(svc.started_at)
+        );
         // The form is the reply's contract: `+00:00`, never `Z`, with 0, 3, 6 or
         // 9 fraction digits (#2257).
         let since = summary["since"].as_str().unwrap();

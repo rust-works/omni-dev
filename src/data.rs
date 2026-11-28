@@ -682,7 +682,6 @@ mod tests {
     use super::*;
     use crate::git::commit::FileChanges;
     use crate::git::{CommitAnalysis, CommitInfo};
-    use chrono::Utc;
 
     // ── update_field_presence ────────────────────────────────────────
 
@@ -855,7 +854,7 @@ mod tests {
         crate::git::CommitInfo {
             hash: hash.to_string(),
             author: "Test <test@test.com>".to_string(),
-            date: chrono::Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: "test".to_string(),
             in_main_branches: Vec::new(),
             analysis: crate::git::CommitAnalysis {
@@ -1083,7 +1082,7 @@ mod tests {
                 CommitInfo {
                     hash: format!("{i:0>40}"),
                     author: "Test <test@test.com>".to_string(),
-                    date: Utc::now().fixed_offset(),
+                    date: jiff::Timestamp::now().into(),
                     original_message: (*msg).to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {

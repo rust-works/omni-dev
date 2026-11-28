@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 
 use crate::transcript::error::Result;
 use crate::transcript::source::{FetchOpts, LanguageInfo, MediaInfo, Transcript, TranscriptSource};
@@ -199,7 +199,8 @@ impl Youtube {
     pub async fn fetch_video_metadata(&self, video_id: &str) -> Result<VideoMetadata> {
         let raw =
             innertube::fetch_player_response_web(&self.http, &self.base_url, video_id).await?;
-        let fetched_at = Utc::now().trunc_subsecs(0);
+        let now = Timestamp::now();
+        let fetched_at = Timestamp::from_second(now.as_second()).unwrap_or(now);
         metadata::parse(&raw, fetched_at)
     }
 }
@@ -714,7 +715,7 @@ mod tests {
         assert_eq!(meta.category.as_deref(), Some("Music"));
         assert_eq!(meta.like_count, Some(19_148_727));
         // fetched_at is stamped at fetch time.
-        assert!((Utc::now() - meta.fetched_at).num_seconds().abs() < 60);
+        assert!((Timestamp::now() - meta.fetched_at).as_secs().abs() < 60);
     }
 
     #[tokio::test]

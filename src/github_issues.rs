@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -543,14 +543,14 @@ fn build_updated_at_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
 fn parse_updated_at_response(
     body: &Value,
     index: &QueryIndex,
-) -> Result<Parsed<Option<DateTime<Utc>>>> {
+) -> Result<Parsed<Option<Timestamp>>> {
     parse_aliased_response(body, index, |item_ref, node| {
         let timestamp = node
             .get("updatedAt")
             .and_then(Value::as_str)
             .with_context(|| format!("item {item_ref}: response had no string `updatedAt`"))?;
-        DateTime::parse_from_rfc3339(timestamp)
-            .map(|timestamp| timestamp.with_timezone(&Utc))
+        timestamp
+            .parse::<jiff::Timestamp>()
             .with_context(|| format!("item {item_ref}: invalid `updatedAt` {timestamp:?}"))
     })
 }
@@ -808,7 +808,7 @@ pub fn fetch_states(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<ItemState
 /// This checks issue-level edits, including state, labels and new comments.
 /// Projects-v2 board/column changes live on `ProjectV2Item` and do **not** bump
 /// the issue's `updatedAt`: this check cannot establish board-state freshness.
-pub fn fetch_updated_at(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<DateTime<Utc>>>> {
+pub fn fetch_updated_at(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<Timestamp>>> {
     fetch_aliased(bin, refs, build_updated_at_query, parse_updated_at_response)
 }
 
@@ -2010,7 +2010,7 @@ i0: issueOrPullRequest(number:2){
         pr.kind = ItemKind::ChangeRequest;
         let refs = [item_ref("c/d", 1), pr, item_ref("c/d", 1)];
         let stamps = retry_on_etxtbsy(|| fetch_updated_at(&bin, &refs)).unwrap();
-        let utc = |s: &str| Some(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
+        let utc = |s: &str| Some(s.parse::<jiff::Timestamp>().unwrap());
         assert_eq!(
             stamps,
             [

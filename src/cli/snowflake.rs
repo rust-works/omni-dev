@@ -10,8 +10,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 use crate::cli::format::TableOrJson;
@@ -464,10 +464,8 @@ async fn call(socket: &Path, op: &str, payload: Value) -> Result<Value> {
 
 /// Seconds elapsed since an RFC 3339 timestamp (0 if absent/unparseable).
 fn age_secs(ts: Option<&str>) -> i64 {
-    ts.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map_or(0, |t| {
-            (Utc::now() - t.with_timezone(&Utc)).num_seconds().max(0)
-        })
+    ts.and_then(|s| s.parse::<jiff::Timestamp>().ok())
+        .map_or(0, |t| (Timestamp::now() - t).as_secs().max(0))
 }
 
 /// A compact `wh/role/db/schema` label from a serialized session context

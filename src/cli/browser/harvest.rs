@@ -166,10 +166,10 @@ fn parse_since(raw: &str) -> Result<i64> {
             .parse::<i64>()
             .with_context(|| format!("invalid --since Unix timestamp: {raw}"));
     }
-    let dt = chrono::DateTime::parse_from_rfc3339(raw).with_context(|| {
+    let dt = raw.parse::<jiff::Timestamp>().with_context(|| {
         format!("invalid --since timestamp (expected Unix seconds or ISO-8601): {raw}")
     })?;
-    Ok(dt.timestamp())
+    Ok(dt.as_second())
 }
 
 #[cfg(test)]

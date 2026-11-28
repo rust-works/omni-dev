@@ -10,13 +10,7 @@ all-features = true
 db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "workspace"
 yanked = "warn"
-ignore = [
-    # chrono is unmaintained, and no version is patched. It is a direct
-    # dependency used across the crate; migrating off it is tracked in
-    # https://github.com/rust-works/omni-dev/issues/2257. Remove this entry
-    # when that lands.
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration tracked in #2257" },
-]
+ignore = []
 
 # ── Licenses ──────────────────────────────────────────────────────────
 [licenses]

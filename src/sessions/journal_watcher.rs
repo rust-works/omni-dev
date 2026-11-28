@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -105,7 +105,7 @@ const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How much later than a pid's first journaled event its process may have
 /// started and still count as the same process: `ps` reports whole seconds.
-const PID_START_SLACK: chrono::Duration = chrono::Duration::seconds(2);
+const PID_START_SLACK: jiff::SignedDuration = jiff::SignedDuration::from_secs(2);
 
 /// How long a stray compaction temp file survives before it is swept.
 const STALE_TMP_AGE: Duration = Duration::from_hours(1);
@@ -126,7 +126,7 @@ pub(crate) trait Probes {
     /// Whether a process with this pid exists.
     fn pid_exists(&self, pid: u32) -> bool;
     /// When the process started, if it can be read.
-    fn pid_start_time(&self, pid: u32) -> Option<DateTime<Utc>>;
+    fn pid_start_time(&self, pid: u32) -> Option<Timestamp>;
     /// The state of a Codex thread's writer lock.
     fn codex_lock(&self, session_id: &str) -> LockState;
 }
@@ -139,7 +139,7 @@ impl Probes for RealProbes {
         pid_liveness::process_exists(pid)
     }
 
-    fn pid_start_time(&self, pid: u32) -> Option<DateTime<Utc>> {
+    fn pid_start_time(&self, pid: u32) -> Option<Timestamp> {
         pid_liveness::process_start_time(pid)
     }
 
@@ -318,11 +318,11 @@ impl Scan<'_> {
 
 /// Replays `records` into a scratch registry and judges the session. Pure apart
 /// from the probes.
-fn assess(records: &[JournalRecord], now: DateTime<Utc>, probes: &dyn Probes) -> Verdict {
+fn assess(records: &[JournalRecord], now: Timestamp, probes: &dyn Probes) -> Verdict {
     let Some(last) = records.iter().map(|r| r.ts).max() else {
         return Verdict::Reject(Reject::Stale);
     };
-    let age = (now - last).to_std().unwrap_or_default();
+    let age = std::time::Duration::try_from(now.duration_since(last)).unwrap_or_default();
     if age > MAX_REPLAY_AGE {
         return Verdict::Reject(Reject::TooOld);
     }
@@ -575,7 +575,8 @@ fn import(scan: &mut Scan<'_>, agent: Agent, file: &JournalFile) -> Option<FileT
         }
         return None;
     }
-    match assess(&records, DateTime::from(scan.now), scan.probes) {
+    let now = Timestamp::try_from(scan.now).unwrap_or_else(|_| Timestamp::now());
+    match assess(&records, now, scan.probes) {
         Verdict::Reject(reason) => {
             tracing::debug!(session_id = %file.id, ?reason, "session_journal_rejected");
             remove(&file.path, "rejected");
@@ -791,12 +792,12 @@ mod tests {
     /// thread's lock says.
     #[derive(Default)]
     struct Fake {
-        pids: RefCell<HashMap<u32, Option<DateTime<Utc>>>>,
+        pids: RefCell<HashMap<u32, Option<Timestamp>>>,
         locks: RefCell<HashMap<String, LockState>>,
     }
 
     impl Fake {
-        fn running(&self, pid: u32, since: DateTime<Utc>) {
+        fn running(&self, pid: u32, since: Timestamp) {
             self.pids.borrow_mut().insert(pid, Some(since));
         }
 
@@ -814,7 +815,7 @@ mod tests {
             self.pids.borrow().contains_key(&pid)
         }
 
-        fn pid_start_time(&self, pid: u32) -> Option<DateTime<Utc>> {
+        fn pid_start_time(&self, pid: u32) -> Option<Timestamp> {
             self.pids.borrow().get(&pid).copied().flatten()
         }
 
@@ -827,15 +828,15 @@ mod tests {
         }
     }
 
-    fn ago(secs: i64) -> DateTime<Utc> {
-        Utc::now() - chrono::Duration::seconds(secs)
+    fn ago(secs: i64) -> Timestamp {
+        Timestamp::now() - jiff::SignedDuration::from_secs(secs)
     }
 
     fn rec(
         id: &str,
         agent: Agent,
         event: SessionEvent,
-        ts: DateTime<Utc>,
+        ts: Timestamp,
         seq: &str,
         pid: Option<u32>,
     ) -> JournalRecord {
@@ -856,7 +857,7 @@ mod tests {
         }
     }
 
-    fn end_rec(id: &str, ts: DateTime<Utc>, seq: &str, pid: Option<u32>) -> JournalRecord {
+    fn end_rec(id: &str, ts: Timestamp, seq: &str, pid: Option<u32>) -> JournalRecord {
         JournalRecord {
             v: 1,
             ts,
@@ -1698,7 +1699,7 @@ mod tests {
                 ID,
                 Agent::Claude,
                 SessionEvent::PreToolUse,
-                base + chrono::Duration::milliseconds(i64::try_from(i).unwrap()),
+                base + jiff::SignedDuration::from_millis(i64::try_from(i).unwrap()),
                 &format!("1-{i:05}"),
                 None,
             );
@@ -1864,7 +1865,7 @@ mod tests {
                 ID,
                 Agent::Claude,
                 SessionEvent::PreToolUse,
-                base + chrono::Duration::milliseconds(i + 1),
+                base + jiff::SignedDuration::from_millis(i + 1),
                 &format!("1-{i:05}"),
                 Some(500),
             ));
@@ -1977,7 +1978,7 @@ mod tests {
         let pid = std::process::id();
         assert!(probes.pid_exists(pid));
         let started = probes.pid_start_time(pid).expect("a start time");
-        assert!(started <= Utc::now() + chrono::Duration::seconds(2));
+        assert!(started <= Timestamp::now() + jiff::SignedDuration::from_secs(2));
         // Whatever Codex home resolves, nobody holds a thread that never existed.
         assert_ne!(probes.codex_lock(ID), LockState::Held);
     }
@@ -2022,7 +2023,7 @@ mod tests {
 
     #[test]
     fn a_journal_with_no_records_or_only_an_end_for_a_session_never_seen_is_rejected() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert_eq!(
             assess(&[], now, &Fake::default()),
             Verdict::Reject(Reject::Stale)

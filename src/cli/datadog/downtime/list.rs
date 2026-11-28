@@ -1,8 +1,8 @@
 //! CLI command for `omni-dev datadog downtime list`.
 
 use anyhow::Result;
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 use crate::cli::datadog::downtime::{render_downtime_table, DowntimeRow};
 use crate::cli::datadog::format::{output_as, OutputFormat};
@@ -65,9 +65,7 @@ async fn run_list(client: &DatadogClient, active_only: bool, output: &OutputForm
 }
 
 fn epoch_to_rfc3339(seconds: i64) -> String {
-    DateTime::<Utc>::from_timestamp(seconds, 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+    crate::utils::time::rfc3339_secs(Timestamp::from_second(seconds).unwrap_or_default())
 }
 
 #[cfg(test)]

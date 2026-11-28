@@ -7,7 +7,7 @@
 //! structured flags so `--status 5xx` and `status:5xx` behave identically.
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use jiff::Timestamp;
 use regex::Regex;
 
 use crate::request_log::{LogRecord, RecordKind, Source};
@@ -29,8 +29,8 @@ pub struct FilterInput<'a> {
 
 /// A compiled predicate over [`LogRecord`] lines.
 pub struct Filter {
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
+    until: Option<Timestamp>,
     method: Option<String>,
     status: Option<StatusMatcher>,
     service: Option<String>,
@@ -155,14 +155,14 @@ impl Filter {
 /// Relative durations never parse as RFC3339 or a date, so the ordering is
 /// unambiguous. An absolute value is that instant; a relative value is
 /// "now minus the duration".
-pub(crate) fn parse_time_bound(s: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn parse_time_bound(s: &str) -> Result<Timestamp> {
     let s = s.trim();
 
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
+    if let Ok(ts) = s.parse::<Timestamp>() {
+        return Ok(ts);
     }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Ok(date.and_time(chrono::NaiveTime::MIN).and_utc());
+    if let Ok(ts) = crate::utils::time::parse_date_as_utc_midnight(s) {
+        return Ok(ts);
     }
 
     parse_since(s)
@@ -171,7 +171,7 @@ pub(crate) fn parse_time_bound(s: &str) -> Result<DateTime<Utc>> {
 /// Parses a relative duration like `30m`, `2h`, `1d`, `1w`, `45s` into the
 /// absolute cutoff `now - duration`. Shared by `--older-than`
 /// (`omni-dev log prune`) and the relative arm of [`parse_time_bound`].
-pub(crate) fn parse_since(s: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn parse_since(s: &str) -> Result<Timestamp> {
     let s = s.trim();
     let (num, unit) = s.split_at(
         s.find(|c: char| !c.is_ascii_digit())
@@ -180,25 +180,26 @@ pub(crate) fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     let n: i64 = num
         .parse()
         .with_context(|| format!("invalid duration: {s} (expected e.g. 30m, 2h, 1d)"))?;
-    let dur = match unit {
-        "s" => Duration::try_seconds(n),
-        "m" => Duration::try_minutes(n),
-        "h" => Duration::try_hours(n),
-        "d" => Duration::try_days(n),
-        "w" => Duration::try_weeks(n),
+    let unit_secs: i64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        "w" => 7 * 24 * 60 * 60,
         other => bail!("invalid duration unit: {other} (use s, m, h, d, or w)"),
-    }
-    .with_context(|| format!("invalid duration: {s} (out of range)"))?;
-    Utc::now()
-        .checked_sub_signed(dur)
+    };
+    n.checked_mul(unit_secs)
+        .and_then(|secs| {
+            Timestamp::now()
+                .checked_sub(jiff::SignedDuration::from_secs(secs))
+                .ok()
+        })
         .with_context(|| format!("invalid duration: {s} (out of range)"))
 }
 
 /// Parses an RFC3339 timestamp into UTC, or `None` if absent/unparseable.
-fn parse_timestamp(ts: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
+fn parse_timestamp(ts: &str) -> Option<Timestamp> {
+    ts.parse::<Timestamp>().ok()
 }
 
 /// A status filter: a set of exact codes and/or `Nxx` classes.
@@ -1072,12 +1073,18 @@ mod tests {
     fn parse_time_bound_accepts_absolute_and_relative() {
         // RFC3339 timestamp.
         let ts = parse_time_bound("2026-07-01T12:00:00Z").unwrap();
-        assert_eq!(ts.to_rfc3339(), "2026-07-01T12:00:00+00:00");
+        assert_eq!(
+            crate::utils::time::rfc3339_offset(ts),
+            "2026-07-01T12:00:00+00:00"
+        );
         // Date-only → midnight UTC.
         let date = parse_time_bound("2026-07-01").unwrap();
-        assert_eq!(date.to_rfc3339(), "2026-07-01T00:00:00+00:00");
+        assert_eq!(
+            crate::utils::time::rfc3339_offset(date),
+            "2026-07-01T00:00:00+00:00"
+        );
         // Relative still works and is in the past.
-        assert!(parse_time_bound("2h").unwrap() < Utc::now());
+        assert!(parse_time_bound("2h").unwrap() < Timestamp::now());
         // Garbage is rejected.
         assert!(parse_time_bound("not-a-time").is_err());
     }

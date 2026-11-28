@@ -11,6 +11,7 @@ pub mod secret;
 pub mod secret_env;
 pub mod settings;
 pub(crate) mod terminal;
+pub mod time;
 
 pub use env::{EnvSource, SystemEnv};
 

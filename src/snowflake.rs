@@ -23,7 +23,6 @@ use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -610,7 +609,7 @@ impl SnowflakeEngine {
         // Proactively renew a session whose token is about to expire, before use.
         if checkout
             .session()
-            .session_expiring_within(TimeDelta::seconds(120))
+            .session_expiring_within(jiff::SignedDuration::from_secs(120))
             && checkout.session().renew().await.is_err()
         {
             pool.discard(checkout);
@@ -723,7 +722,7 @@ async fn keep_session_alive(session: &SnowflakeSession, interval: Duration) -> b
     let margin_secs = i64::try_from(interval.as_secs())
         .unwrap_or(i64::MAX)
         .saturating_add(HEARTBEAT_RENEW_MARGIN_SECS);
-    let margin = TimeDelta::try_seconds(margin_secs).unwrap_or(TimeDelta::MAX);
+    let margin = jiff::SignedDuration::from_secs(margin_secs);
     if session.session_expiring_within(margin) {
         match session.renew().await {
             Ok(()) => {}

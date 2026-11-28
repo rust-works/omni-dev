@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::pr_status::PrCheckState;
 use crate::sessions::{SessionState, Source};
@@ -144,7 +144,7 @@ pub struct SessionBadge {
     /// The agent's display name (`Claude`, `Codex`, `pi`, or an unknown tag
     /// verbatim), for the row summary (#1908).
     pub agent: String,
-    pub last_seen: DateTime<Utc>,
+    pub last_seen: Timestamp,
 }
 
 /// The display name for a wire `agent` tag: absent means Claude, a known tag
@@ -415,7 +415,7 @@ mod tests {
             agent: None,
             state: SessionState::Working,
             source: Source::Terminal,
-            last_seen: chrono::Utc::now(),
+            last_seen: jiff::Timestamp::now(),
         }
     }
 

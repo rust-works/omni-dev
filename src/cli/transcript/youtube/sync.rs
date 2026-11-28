@@ -14,9 +14,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Months, NaiveDate, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use jiff::{SignedDuration, Span, Timestamp};
 
 use crate::cli::transcript::format::CliFormat;
 use crate::transcript::error::TranscriptError;
@@ -112,7 +112,7 @@ impl SyncCommand {
         let refresh_cutoff = self
             .refresh_metadata_older_than
             .as_deref()
-            .map(|s| parse_date_spec(s, Utc::now()))
+            .map(|s| parse_date_spec(s, Timestamp::now()))
             .transpose()
             .context("Invalid --refresh-metadata-older-than")?;
         Ok(SyncPlan {
@@ -132,17 +132,12 @@ impl SyncCommand {
 
 /// Parse a `--since` value as either a bare `YYYY-MM-DD` date (interpreted as
 /// midnight UTC) or a full RFC 3339 timestamp.
-fn parse_since(s: &str) -> Result<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
+fn parse_since(s: &str) -> Result<Timestamp> {
+    if let Ok(ts) = s.parse::<Timestamp>() {
+        return Ok(ts);
     }
-    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .with_context(|| format!("expected YYYY-MM-DD or RFC 3339, got `{s}`"))?;
-    #[allow(clippy::expect_used)]
-    let naive = date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always a valid time");
-    Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
+    crate::utils::time::parse_date_as_utc_midnight(s)
+        .with_context(|| format!("expected YYYY-MM-DD or RFC 3339, got `{s}`"))
 }
 
 /// Parse a `--refresh-metadata-older-than` value into an absolute cutoff,
@@ -153,26 +148,22 @@ fn parse_since(s: &str) -> Result<DateTime<Utc>> {
 /// - `YYYY-MM-DD` (`2026-06-01`) — midnight UTC (consistent with `--since`);
 /// - relative `<N> <unit>[s] ago` (`2 days ago`, `1 hour ago`) — units
 ///   minute, hour, day, week, month, year.
-fn parse_date_spec(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+fn parse_date_spec(s: &str, now: Timestamp) -> Result<Timestamp> {
     let s = s.trim();
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
+    if let Ok(ts) = s.parse::<Timestamp>() {
+        return Ok(ts);
     }
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        #[allow(clippy::expect_used)]
-        let naive = date
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always a valid time");
-        return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
+    if let Ok(ts) = crate::utils::time::parse_date_as_utc_midnight(s) {
+        return Ok(ts);
     }
     parse_relative(s, now)
         .with_context(|| format!("expected YYYY-MM-DD, RFC 3339, or `<N> <unit> ago`, got `{s}`"))
 }
 
 /// Resolve a relative `<N> <unit>[s] ago` spec against `now`. Months and years
-/// use calendar arithmetic ([`chrono::Months`]); smaller units use fixed
-/// [`chrono::Duration`] offsets.
-fn parse_relative(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+/// use calendar arithmetic in UTC (a month back from the 31st is the last day
+/// of the shorter month); smaller units use fixed [`SignedDuration`] offsets.
+fn parse_relative(s: &str, now: Timestamp) -> Result<Timestamp> {
     let lower = s.to_lowercase();
     let parts: Vec<&str> = lower.split_whitespace().collect();
     if parts.len() != 3 || parts[2] != "ago" {
@@ -186,17 +177,26 @@ fn parse_relative(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     }
     // Normalise an optional trailing plural, e.g. `days` -> `day`.
     let unit = parts[1].strip_suffix('s').unwrap_or(parts[1]);
+    let back = |unit_secs: i64| -> Result<Timestamp> {
+        n.checked_mul(unit_secs)
+            .and_then(|secs| now.checked_sub(SignedDuration::from_secs(secs)).ok())
+            .context("date underflow")
+    };
+    let back_calendar = |span: std::result::Result<Span, jiff::Error>| -> Result<Timestamp> {
+        span.and_then(|span| {
+            now.to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .checked_sub(span)
+        })
+        .map(|zoned| zoned.timestamp())
+        .context("date underflow")
+    };
     let cutoff = match unit {
-        "minute" => now - Duration::minutes(n),
-        "hour" => now - Duration::hours(n),
-        "day" => now - Duration::days(n),
-        "week" => now - Duration::weeks(n),
-        "month" => now
-            .checked_sub_months(Months::new(n as u32))
-            .context("date underflow")?,
-        "year" => now
-            .checked_sub_months(Months::new(n as u32 * 12))
-            .context("date underflow")?,
+        "minute" => back(60)?,
+        "hour" => back(60 * 60)?,
+        "day" => back(24 * 60 * 60)?,
+        "week" => back(7 * 24 * 60 * 60)?,
+        "month" => back_calendar(Span::new().try_months(n))?,
+        "year" => back_calendar(Span::new().try_years(n))?,
         other => anyhow::bail!("unknown relative unit `{other}`"),
     };
     Ok(cutoff)
@@ -211,11 +211,11 @@ struct SyncPlan {
     format: CliFormat,
     allow_auto: bool,
     full: bool,
-    since: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
     /// When set, metadata sidecars whose `fetched_at` predates this are
     /// re-fetched. `None` means missing sidecars are still backfilled but
     /// existing ones are never refreshed.
-    refresh_cutoff: Option<DateTime<Utc>>,
+    refresh_cutoff: Option<Timestamp>,
     concurrency: usize,
     dry_run: bool,
 }
@@ -540,7 +540,7 @@ fn scan_synced_ids(dir: &Path) -> Vec<String> {
 fn plan_metadata(
     dir: &Path,
     candidate_ids: &[String],
-    refresh_cutoff: Option<DateTime<Utc>>,
+    refresh_cutoff: Option<Timestamp>,
 ) -> Vec<MetaItem> {
     let mut items = Vec::new();
     for id in candidate_ids {
@@ -665,9 +665,15 @@ mod tests {
     #[test]
     fn parse_since_accepts_date_and_rfc3339() {
         let date = parse_since("2024-11-20").unwrap();
-        assert_eq!(date.to_rfc3339(), "2024-11-20T00:00:00+00:00");
+        assert_eq!(
+            crate::utils::time::rfc3339_offset(date),
+            "2024-11-20T00:00:00+00:00"
+        );
         let ts = parse_since("2024-11-20T12:30:00+00:00").unwrap();
-        assert_eq!(ts.to_rfc3339(), "2024-11-20T12:30:00+00:00");
+        assert_eq!(
+            crate::utils::time::rfc3339_offset(ts),
+            "2024-11-20T12:30:00+00:00"
+        );
     }
 
     #[test]
@@ -675,7 +681,7 @@ mod tests {
         assert!(parse_since("not-a-date").is_err());
     }
 
-    fn now_fixed() -> DateTime<Utc> {
+    fn now_fixed() -> Timestamp {
         "2026-06-21T12:00:00Z".parse().unwrap()
     }
 
@@ -683,13 +689,13 @@ mod tests {
     fn parse_date_spec_accepts_absolute_forms() {
         let now = now_fixed();
         assert_eq!(
-            parse_date_spec("2026-06-01", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("2026-06-01", now).unwrap()),
             "2026-06-01T00:00:00+00:00"
         );
         assert_eq!(
-            parse_date_spec("2026-06-01T12:00:00+10:00", now)
-                .unwrap()
-                .to_rfc3339(),
+            crate::utils::time::rfc3339_offset(
+                parse_date_spec("2026-06-01T12:00:00+10:00", now).unwrap()
+            ),
             "2026-06-01T02:00:00+00:00"
         );
     }
@@ -698,28 +704,28 @@ mod tests {
     fn parse_date_spec_resolves_relative_units_against_now() {
         let now = now_fixed();
         assert_eq!(
-            parse_date_spec("30 minutes ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("30 minutes ago", now).unwrap()),
             "2026-06-21T11:30:00+00:00"
         );
         assert_eq!(
-            parse_date_spec("2 hours ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("2 hours ago", now).unwrap()),
             "2026-06-21T10:00:00+00:00"
         );
         assert_eq!(
-            parse_date_spec("2 days ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("2 days ago", now).unwrap()),
             "2026-06-19T12:00:00+00:00"
         );
         assert_eq!(
-            parse_date_spec("1 week ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("1 week ago", now).unwrap()),
             "2026-06-14T12:00:00+00:00"
         );
         // Calendar arithmetic for months/years.
         assert_eq!(
-            parse_date_spec("3 months ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("3 months ago", now).unwrap()),
             "2026-03-21T12:00:00+00:00"
         );
         assert_eq!(
-            parse_date_spec("1 year ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("1 year ago", now).unwrap()),
             "2025-06-21T12:00:00+00:00"
         );
     }
@@ -728,7 +734,7 @@ mod tests {
     fn parse_date_spec_accepts_singular_and_is_case_insensitive() {
         let now = now_fixed();
         assert_eq!(
-            parse_date_spec("1 Day Ago", now).unwrap().to_rfc3339(),
+            crate::utils::time::rfc3339_offset(parse_date_spec("1 Day Ago", now).unwrap()),
             "2026-06-20T12:00:00+00:00"
         );
     }
@@ -1352,7 +1358,7 @@ mod tests {
             "fetched_at: \"2026-12-31T00:00:00Z\"\n",
         )
         .unwrap();
-        let cutoff: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let cutoff: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
         let ids = vec!["miss".to_string(), "stale".to_string(), "fresh".to_string()];
 
         let items = plan_metadata(p, &ids, Some(cutoff));

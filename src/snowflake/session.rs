@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -115,7 +115,8 @@ pub struct RunningQuery {
     /// A single-line, truncated preview of the SQL.
     pub sql: String,
     /// When the query started running.
-    pub started_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub started_at: Timestamp,
 }
 
 /// One pool member: an authenticated session and its tracked state. The session
@@ -125,7 +126,7 @@ struct Slot<S> {
     id: u64,
     base: QueryContext,
     current: QueryContext,
-    last_used: DateTime<Utc>,
+    last_used: Timestamp,
     query_count: u64,
     running: Option<RunningQuery>,
     /// A handle to cancel the running statement, captured at
@@ -146,7 +147,8 @@ pub struct MemberInfo {
     /// The context currently applied to the member.
     pub context: QueryContext,
     /// When the member last finished a query.
-    pub last_used: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub last_used: Timestamp,
     /// How many queries this member has run.
     pub query_count: u64,
     /// The query currently running, when busy.
@@ -212,8 +214,8 @@ impl<S> Drop for Checkout<S> {
 /// Mutable per-pool bookkeeping for the (sync) menu/status snapshot.
 #[derive(Clone, Debug)]
 struct PoolMeta {
-    created_at: DateTime<Utc>,
-    last_used: DateTime<Utc>,
+    created_at: Timestamp,
+    last_used: Timestamp,
     query_count: u64,
 }
 
@@ -227,9 +229,11 @@ pub struct SessionInfo {
     /// The authenticated user.
     pub user: String,
     /// When the pool was created (first query).
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub created_at: Timestamp,
     /// When the pool last served a query.
-    pub last_used: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub last_used: Timestamp,
     /// How many queries the pool has served.
     pub query_count: u64,
     /// Live (authenticated) sessions in the pool.
@@ -267,7 +271,7 @@ impl<S> SessionPool<S> {
         id: u64,
         key: SessionKey,
         max: usize,
-        now: DateTime<Utc>,
+        now: Timestamp,
         auth_gate: Arc<TokioMutex<()>>,
     ) -> Self {
         let max = max.max(1);
@@ -344,7 +348,7 @@ impl<S> SessionPool<S> {
             id,
             base: base.clone(),
             current: base.clone(),
-            last_used: Utc::now(),
+            last_used: Timestamp::now(),
             query_count: 0,
             running: None,
             running_abort: None,
@@ -431,7 +435,7 @@ impl<S> SessionPool<S> {
             let mut slots = self.lock_slots();
             if let Some(slot) = slots.iter_mut().find(|slot| slot.id == checkout.id) {
                 slot.current = current;
-                slot.last_used = Utc::now();
+                slot.last_used = Timestamp::now();
                 slot.running = None;
                 slot.running_abort = None;
                 slot.session = session;
@@ -452,7 +456,7 @@ impl<S> SessionPool<S> {
             slot.query_count += 1;
             slot.running = Some(RunningQuery {
                 sql,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
             });
             slot.running_abort = abort;
         }
@@ -487,7 +491,7 @@ impl<S> SessionPool<S> {
     /// Records that the pool served a query.
     pub fn touch(&self) {
         let mut meta = self.lock_meta();
-        meta.last_used = Utc::now();
+        meta.last_used = Timestamp::now();
         meta.query_count += 1;
     }
 
@@ -590,7 +594,7 @@ impl PoolRegistry {
             id,
             key.clone(),
             max,
-            Utc::now(),
+            Timestamp::now(),
             Arc::clone(&self.auth_gate),
         ));
         map.insert(key.clone(), Arc::clone(&pool));
@@ -722,7 +726,7 @@ mod tests {
             1,
             SessionKey::new("ACCT", "user"),
             max,
-            Utc::now(),
+            Timestamp::now(),
             Arc::new(TokioMutex::new(())),
         );
         (pool, Arc::new(AtomicU32::new(0)))

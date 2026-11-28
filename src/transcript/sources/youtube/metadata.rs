@@ -16,7 +16,7 @@
 //! known-healthy videos, the field paths below (`publishDate`, `likeCount`,
 //! `microformat.playerMicroformatRenderer`, …) are the place to re-check.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::transcript::error::{Result, TranscriptError};
@@ -82,7 +82,8 @@ pub struct VideoMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     /// When this sidecar was fetched (UTC). The refresh-staleness key.
-    pub fetched_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    pub fetched_at: Timestamp,
 }
 
 fn default_schema() -> u32 {
@@ -97,7 +98,7 @@ fn default_schema() -> u32 {
 /// written from `videoDetails` alone (microformat-only fields stay `None`).
 /// Fails with [`TranscriptError::ParseError`] only if `videoDetails` itself is
 /// missing (a removed/blocked video the WEB client won't describe).
-pub fn parse(raw: &str, fetched_at: DateTime<Utc>) -> Result<VideoMetadata> {
+pub fn parse(raw: &str, fetched_at: Timestamp) -> Result<VideoMetadata> {
     let web: WebPlayerResponse = serde_json::from_str(raw)
         .map_err(|e| TranscriptError::ParseError(format!("WEB playerResponse: {e}")))?;
 
@@ -159,7 +160,7 @@ pub fn parse(raw: &str, fetched_at: DateTime<Utc>) -> Result<VideoMetadata> {
 /// Used for staleness decisions during a directory scan. Returns `None` if the
 /// YAML is corrupt or carries no parseable `fetched_at` — callers treat that as
 /// "sidecar missing" and re-fetch.
-pub fn read_fetched_at(yaml: &str) -> Option<DateTime<Utc>> {
+pub fn read_fetched_at(yaml: &str) -> Option<Timestamp> {
     serde_norway::from_str::<SidecarStamp>(yaml)
         .ok()
         .map(|s| s.fetched_at)
@@ -169,7 +170,8 @@ pub fn read_fetched_at(yaml: &str) -> Option<DateTime<Utc>> {
 /// sidecar without requiring the rest of the document to be well-formed.
 #[derive(Deserialize)]
 struct SidecarStamp {
-    fetched_at: DateTime<Utc>,
+    #[serde(with = "crate::utils::time::serde_rfc3339")]
+    fetched_at: Timestamp,
 }
 
 // ── Serde view of the WEB `/player` response ──
@@ -284,7 +286,7 @@ mod tests {
     const WITH_MICROFORMAT: &str = include_str!("fixtures/player_response_web_metadata.json");
     const NO_MICROFORMAT: &str = include_str!("fixtures/player_response_web_no_microformat.json");
 
-    fn fixed_fetched_at() -> DateTime<Utc> {
+    fn fixed_fetched_at() -> Timestamp {
         "2026-06-11T03:12:45Z".parse().unwrap()
     }
 

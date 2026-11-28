@@ -139,8 +139,6 @@ pub(crate) fn plan_batches(
 mod tests {
     use std::io::Write;
 
-    use chrono::Utc;
-
     use super::*;
     use crate::claude::ai::AiClientMetadata;
     use crate::git::commit::{CommitAnalysis, FileChange, FileChanges, FileDiffRef};
@@ -164,7 +162,7 @@ mod tests {
         let commit = CommitInfo {
             hash: "abc123".to_string(),
             author: "Test Author <test@example.com>".to_string(),
-            date: Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: "test commit".to_string(),
             in_main_branches: vec![],
             analysis: CommitAnalysis {
@@ -269,7 +267,7 @@ mod tests {
         let commit = CommitInfo {
             hash: "abc123".to_string(),
             author: "Test Author <test@example.com>".to_string(),
-            date: Utc::now().fixed_offset(),
+            date: jiff::Timestamp::now().into(),
             original_message: "test commit".to_string(),
             in_main_branches: vec![],
             analysis: CommitAnalysis {

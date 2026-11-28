@@ -3,7 +3,6 @@
 use std::fs;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset};
 use git2::{Commit, Repository};
 use globset::Glob;
 use serde::{Deserialize, Serialize};
@@ -11,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::context::ScopeDefinition;
 use crate::git::diff_split::split_by_file;
 use crate::git::lint;
+use crate::utils::time::OffsetTimestamp;
 
 /// Commit information structure, generic over analysis type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct CommitInfo<A = CommitAnalysis> {
     /// Commit author name and email address.
     pub author: String,
     /// Commit date in ISO format with timezone.
-    pub date: DateTime<FixedOffset>,
+    pub date: OffsetTimestamp,
     /// The original commit message as written by the author.
     pub original_message: String,
     /// Array of remote main branches that contain this commit.
@@ -126,14 +126,13 @@ impl CommitInfo {
             commit.author().email().unwrap_or("unknown@example.com")
         );
 
-        let timestamp = commit.author().when();
-        let date = DateTime::from_timestamp(timestamp.seconds(), 0)
-            .context("Invalid commit timestamp")?
-            .with_timezone(
-                #[allow(clippy::unwrap_used)] // Offset 0 is always valid
-                &FixedOffset::east_opt(timestamp.offset_minutes() * 60)
-                    .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap()),
-            );
+        let when = commit.author().when();
+        let timestamp =
+            jiff::Timestamp::from_second(when.seconds()).context("Invalid commit timestamp")?;
+        // git stores the offset in minutes, so it is always a valid one.
+        let offset = jiff::tz::Offset::from_seconds(when.offset_minutes() * 60)
+            .unwrap_or(jiff::tz::Offset::UTC);
+        let date = OffsetTimestamp::new(timestamp, offset);
 
         let original_message = commit.message().unwrap_or("").to_string();
 
@@ -1567,7 +1566,7 @@ mod tests {
             base: CommitInfo {
                 hash: "a".repeat(40),
                 author: "Test <test@example.com>".to_string(),
-                date: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap(),
+                date: "2024-01-01T00:00:00+00:00".parse().unwrap(),
                 original_message: message.to_string(),
                 in_main_branches: vec![],
                 analysis: CommitAnalysisForAI {
@@ -1972,7 +1971,7 @@ mod tests {
         let info = CommitInfo {
             hash: "a".repeat(40),
             author: "Test <test@example.com>".to_string(),
-            date: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap(),
+            date: "2024-01-01T00:00:00+00:00".parse().unwrap(),
             original_message: "feat(cli): add flag".to_string(),
             in_main_branches: vec!["origin/main".to_string()],
             analysis: CommitAnalysis {
@@ -2071,7 +2070,7 @@ diff_file: "/tmp/test.diff"
         CommitInfo {
             hash: "abc123def456abc123def456abc123def456abc1".to_string(),
             author: "Test Author".to_string(),
-            date: DateTime::parse_from_rfc3339("2025-01-01T00:00:00+00:00").unwrap(),
+            date: "2025-01-01T00:00:00+00:00".parse().unwrap(),
             original_message: "feat(cli): original message".to_string(),
             in_main_branches: vec!["main".to_string()],
             analysis: CommitAnalysis {
